@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Feature Matrix Editor
+Feature Matrix Editor V3
 ====================
 
 Complete tool for editing and enhancing HEEDS feature matrices with parameter data.
@@ -57,6 +57,21 @@ class FeatureMatrixEditor:
             'K4_7', 'K5_7', 'K6_7', 'K4_8', 'K5_8', 'K6_8', 'K4_9', 'K5_9', 'K6_9',
             'K4_10', 'K5_10', 'K6_10'
         ]
+        
+        # HEEDS parameter to stiffness mapping
+        self.stiffness_mapping = {
+            1: 1e4,   # loose
+            2: 1e5,   # very loose threshold
+            3: 1e6,   # borderline
+            4: 1e7,   # borderline 
+            5: 1e8,   # standard (industry baseline)
+            6: 1e9,   # tight
+            7: 1e10,  # tight
+            8: 1e11,  # tight
+            9: 1e12,  # very tight
+            # 10: 1e13, # extremely tight (unseen)
+            # 11: 1e14, # extremely tight (unseen)
+        }
         
         self.log("🚀 Feature Matrix Editor Initialized")
         self.log(f"📁 Output directory: {self.output_dir}")
@@ -131,7 +146,12 @@ class FeatureMatrixEditor:
             self.log(f"   📊 Success rate: {scan_results['success_rate']:.1%}")
             
             if failed_designs:
-                self.log(f"   🔍 Failed design examples: {failed_designs[:10]}")
+                # Log first 20 failed designs for debugging
+                failed_sample = failed_designs[:20]
+                if len(failed_designs) > 20:
+                    self.log(f"   🚫 Omitted designs: {failed_sample} (showing first 20 of {len(failed_designs)})")
+                else:
+                    self.log(f"   🚫 Omitted designs: {failed_designs}")
             
             return scan_results
             
@@ -358,6 +378,9 @@ class FeatureMatrixEditor:
             available_columns = [col for col in final_columns if col in merged_df.columns]
             merged_df = merged_df[available_columns]
             
+            # Apply parameter-based CBUSH loose detection (replace simulation-based)
+            merged_df = self.add_parameter_based_cbush_detection(merged_df)
+            
             self.log(f"   ✅ Merged dataset: {len(merged_df):,} designs")
             self.log(f"   📊 Total columns: {len(merged_df.columns)}")
             self.log(f"   🔧 Parameters: {len(param_columns)}")
@@ -371,6 +394,86 @@ class FeatureMatrixEditor:
             self.log(error_msg)
             self.failed_operations.append(error_msg)
             return None
+    
+    def add_parameter_based_cbush_detection(self, df):
+        """
+        Add parameter-based CBUSH loose detection using conservative threshold (< 1e5).
+        
+        IMPORTANT: This replaces the simulation-based cbush_X_loose columns which appear
+        to have incorrect results (high stiffness CBUSHes showing as loose).
+        
+        TODO: Update the main GUI feature extraction process to use this logic instead
+        of post-HEEDS simulation analysis. The simulation-based detection is showing
+        physically incorrect results.
+        
+        Args:
+            df: DataFrame with parameter columns (K4_X, K5_X, K6_X)
+            
+        Returns:
+            DataFrame with updated cbush_X_loose columns
+        """
+        try:
+            self.log("🔧 Applying parameter-based CBUSH loose detection (conservative < 1e5)...")
+            
+            # Keep original simulation-based columns for comparison
+            simulation_cols = [col for col in df.columns if col.startswith('cbush_') and col.endswith('_loose')]
+            for col in simulation_cols:
+                if col in df.columns:
+                    df[f'{col}_simulation'] = df[col].copy()
+            
+            # Apply parameter-based logic
+            loose_count_by_cbush = {}
+            
+            for cbush_num in range(1, 11):
+                if cbush_num == 1:
+                    # CBUSH 1 always tight (constant at industry standard K=5=1e8)
+                    df[f'cbush_{cbush_num}_loose'] = 0
+                    loose_count_by_cbush[cbush_num] = 0
+                else:
+                    # CBUSHes 2-10: Check parameter values
+                    k4_col = f'K4_{cbush_num}'
+                    k5_col = f'K5_{cbush_num}'
+                    k6_col = f'K6_{cbush_num}'
+                    
+                    if all(col in df.columns for col in [k4_col, k5_col, k6_col]):
+                        def is_loose_conservative(row):
+                            """Conservative loose detection: minimum stiffness < 1e5"""
+                            k4_stiffness = self.stiffness_mapping.get(row[k4_col], 1e8)
+                            k5_stiffness = self.stiffness_mapping.get(row[k5_col], 1e8) 
+                            k6_stiffness = self.stiffness_mapping.get(row[k6_col], 1e8)
+                            
+                            min_stiffness = min(k4_stiffness, k5_stiffness, k6_stiffness)
+                            return 1 if min_stiffness < 1e5 else 0
+                        
+                        df[f'cbush_{cbush_num}_loose'] = df.apply(is_loose_conservative, axis=1)
+                        loose_count = df[f'cbush_{cbush_num}_loose'].sum()
+                        loose_count_by_cbush[cbush_num] = loose_count
+                    else:
+                        self.log(f"   ⚠️  Missing parameter columns for CBUSH {cbush_num}, keeping original")
+                        loose_count_by_cbush[cbush_num] = df.get(f'cbush_{cbush_num}_loose', pd.Series([0])).sum()
+            
+            # Log the new distribution
+            self.log("   📊 Parameter-based CBUSH loose distribution:")
+            total_designs = len(df)
+            for cbush_num in range(1, 11):
+                if cbush_num in loose_count_by_cbush:
+                    count = loose_count_by_cbush[cbush_num]
+                    percentage = (count / total_designs * 100) if total_designs > 0 else 0
+                    self.log(f"      CBUSH {cbush_num}: {count:,} loose ({percentage:.1f}%)")
+            
+            self.log("   ✅ Parameter-based CBUSH detection complete")
+            
+            # Add documentation columns
+            df['cbush_detection_method'] = 'parameter_based_conservative'
+            df['loose_threshold'] = '< 1e5'
+            
+            return df
+            
+        except Exception as e:
+            error_msg = f"❌ Failed to apply parameter-based CBUSH detection: {str(e)}"
+            self.log(error_msg)
+            self.failed_operations.append(error_msg)
+            return df
     
     def process_single_study(self, param_file, matrix_file, heeds_directory, study_name=None, output_name=None):
         """
@@ -697,7 +800,7 @@ class FeatureMatrixEditorGUI:
         """Initialize the GUI."""
         self.root = root
         self.root.title("Feature Matrix Editor v1.0")
-        self.root.geometry("1000x800")
+        self.root.geometry("1400x900")
         self.root.configure(bg='#f0f0f0')
         
         # Initialize backend
@@ -715,6 +818,12 @@ class FeatureMatrixEditorGUI:
         # Create GUI
         self.create_widgets()
         
+        # Data storage for previews
+        self.param_data = None
+        self.matrix_data = None
+        self.combined_data = None
+        self.loaded_full_matrix = None
+        
         self.log_message("🚀 Feature Matrix Editor GUI Ready!")
         self.log_message("📋 Select your files and click 'Process Study' to begin")
     
@@ -729,12 +838,28 @@ class FeatureMatrixEditorGUI:
                                  font=('Arial', 12), bg='#f0f0f0', fg='#7f8c8d')
         subtitle_label.pack(pady=5)
         
-        # Main container
-        main_frame = ttk.Frame(self.root)
-        main_frame.pack(fill='both', expand=True, padx=20, pady=20)
+        # Create main container with horizontal layout
+        main_container = tk.Frame(self.root)
+        main_container.pack(fill='both', expand=True, padx=10, pady=10)
         
+        # Left panel for controls
+        left_panel = tk.Frame(main_container)
+        left_panel.pack(side='left', fill='y', padx=(0, 10))
+        
+        # Right panel for data previews
+        right_panel = tk.Frame(main_container)
+        right_panel.pack(side='right', fill='both', expand=True)
+        
+        # Create control widgets in left panel
+        self.create_control_widgets(left_panel)
+        
+        # Create data preview tabs in right panel
+        self.create_data_preview_tabs(right_panel)
+    
+    def create_control_widgets(self, parent):
+        """Create the control widgets in the left panel."""
         # File selection frame
-        file_frame = ttk.LabelFrame(main_frame, text="📁 File Selection")
+        file_frame = ttk.LabelFrame(parent, text="📁 File Selection")
         file_frame.pack(fill='x', pady=10)
         
         # Parameter file
@@ -743,7 +868,7 @@ class FeatureMatrixEditorGUI:
         tk.Label(param_frame, text="Parameter File (CSV/TSV):", font=('Arial', 10, 'bold')).pack(anchor='w')
         param_input_frame = tk.Frame(param_frame)
         param_input_frame.pack(fill='x', pady=2)
-        tk.Entry(param_input_frame, textvariable=self.param_file_var, width=80, font=('Arial', 9)).pack(side='left', fill='x', expand=True)
+        tk.Entry(param_input_frame, textvariable=self.param_file_var, width=50, font=('Arial', 9)).pack(side='left', fill='x', expand=True)
         tk.Button(param_input_frame, text="Browse", command=self.browse_param_file, 
                  bg='#3498db', fg='white', font=('Arial', 9, 'bold')).pack(side='right', padx=(5,0))
         
@@ -753,7 +878,7 @@ class FeatureMatrixEditorGUI:
         tk.Label(matrix_frame, text="Feature Matrix File (CSV):", font=('Arial', 10, 'bold')).pack(anchor='w')
         matrix_input_frame = tk.Frame(matrix_frame)
         matrix_input_frame.pack(fill='x', pady=2)
-        tk.Entry(matrix_input_frame, textvariable=self.matrix_file_var, width=80, font=('Arial', 9)).pack(side='left', fill='x', expand=True)
+        tk.Entry(matrix_input_frame, textvariable=self.matrix_file_var, width=50, font=('Arial', 9)).pack(side='left', fill='x', expand=True)
         tk.Button(matrix_input_frame, text="Browse", command=self.browse_matrix_file,
                  bg='#3498db', fg='white', font=('Arial', 9, 'bold')).pack(side='right', padx=(5,0))
         
@@ -763,29 +888,25 @@ class FeatureMatrixEditorGUI:
         tk.Label(heeds_frame, text="HEEDS Directory (containing POST_0):", font=('Arial', 10, 'bold')).pack(anchor='w')
         heeds_input_frame = tk.Frame(heeds_frame)
         heeds_input_frame.pack(fill='x', pady=2)
-        tk.Entry(heeds_input_frame, textvariable=self.heeds_dir_var, width=80, font=('Arial', 9)).pack(side='left', fill='x', expand=True)
+        tk.Entry(heeds_input_frame, textvariable=self.heeds_dir_var, width=50, font=('Arial', 9)).pack(side='left', fill='x', expand=True)
         tk.Button(heeds_input_frame, text="Browse", command=self.browse_heeds_dir,
                  bg='#3498db', fg='white', font=('Arial', 9, 'bold')).pack(side='right', padx=(5,0))
         
         # Settings frame
-        settings_frame = ttk.LabelFrame(main_frame, text="⚙️ Processing Settings")
+        settings_frame = ttk.LabelFrame(parent, text="⚙️ Processing Settings")
         settings_frame.pack(fill='x', pady=10)
         
-        # Study name and output directory
-        settings_row1 = tk.Frame(settings_frame)
-        settings_row1.pack(fill='x', padx=10, pady=5)
-        
         # Study name
-        study_col = tk.Frame(settings_row1)
-        study_col.pack(side='left', fill='x', expand=True)
-        tk.Label(study_col, text="Study Name:", font=('Arial', 10, 'bold')).pack(anchor='w')
-        tk.Entry(study_col, textvariable=self.study_name_var, width=30, font=('Arial', 9)).pack(fill='x', pady=2)
+        study_frame = tk.Frame(settings_frame)
+        study_frame.pack(fill='x', padx=10, pady=5)
+        tk.Label(study_frame, text="Study Name:", font=('Arial', 10, 'bold')).pack(anchor='w')
+        tk.Entry(study_frame, textvariable=self.study_name_var, width=40, font=('Arial', 9)).pack(fill='x', pady=2)
         
         # Output directory
-        output_col = tk.Frame(settings_row1)
-        output_col.pack(side='right', fill='x', expand=True, padx=(20,0))
-        tk.Label(output_col, text="Output Directory:", font=('Arial', 10, 'bold')).pack(anchor='w')
-        output_input_frame = tk.Frame(output_col)
+        output_frame = tk.Frame(settings_frame)
+        output_frame.pack(fill='x', padx=10, pady=5)
+        tk.Label(output_frame, text="Output Directory:", font=('Arial', 10, 'bold')).pack(anchor='w')
+        output_input_frame = tk.Frame(output_frame)
         output_input_frame.pack(fill='x', pady=2)
         tk.Entry(output_input_frame, textvariable=self.output_dir_var, width=30, font=('Arial', 9)).pack(side='left', fill='x', expand=True)
         tk.Button(output_input_frame, text="Browse", command=self.browse_output_dir,
@@ -798,40 +919,332 @@ class FeatureMatrixEditorGUI:
                       font=('Arial', 10)).pack(anchor='w')
         
         # Processing controls
-        control_frame = ttk.LabelFrame(main_frame, text="🚀 Processing Controls")
+        control_frame = ttk.LabelFrame(parent, text="🚀 Processing Controls")
         control_frame.pack(fill='x', pady=10)
         
         button_frame = tk.Frame(control_frame)
         button_frame.pack(fill='x', padx=10, pady=10)
         
-        tk.Button(button_frame, text="🔄 Process Single Study", command=self.process_single_study,
-                 bg='#27ae60', fg='white', font=('Arial', 12, 'bold'), height=2, width=20).pack(side='left', padx=5)
+        tk.Button(button_frame, text="🔄 Process Study", command=self.process_single_study,
+                 bg='#27ae60', fg='white', font=('Arial', 11, 'bold'), height=2, width=18).pack(fill='x', pady=2)
         
-        tk.Button(button_frame, text="🔗 Load & Combine Studies", command=self.combine_studies,
-                 bg='#9b59b6', fg='white', font=('Arial', 12, 'bold'), height=2, width=20).pack(side='left', padx=5)
+        tk.Button(button_frame, text="🔗 Combine Studies", command=self.combine_studies,
+                 bg='#9b59b6', fg='white', font=('Arial', 11, 'bold'), height=2, width=18).pack(fill='x', pady=2)
         
         tk.Button(button_frame, text="📋 Clear Log", command=self.clear_log,
-                 bg='#95a5a6', fg='white', font=('Arial', 10, 'bold'), height=2, width=15).pack(side='right', padx=5)
+                 bg='#95a5a6', fg='white', font=('Arial', 10, 'bold'), height=1, width=18).pack(fill='x', pady=2)
         
         # Progress frame
-        progress_frame = ttk.LabelFrame(main_frame, text="📊 Progress")
+        progress_frame = ttk.LabelFrame(parent, text="📊 Progress")
         progress_frame.pack(fill='x', pady=10)
         
         self.progress_var = tk.DoubleVar()
         self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_var, 
-                                          maximum=100, length=400, mode='indeterminate')
+                                          maximum=100, length=300, mode='indeterminate')
         self.progress_bar.pack(pady=10)
         
         self.status_label = tk.Label(progress_frame, text="Ready", font=('Arial', 10), fg='#7f8c8d')
         self.status_label.pack()
         
         # Log frame
-        log_frame = ttk.LabelFrame(main_frame, text="📜 Processing Log")
+        log_frame = ttk.LabelFrame(parent, text="📜 Processing Log")
         log_frame.pack(fill='both', expand=True, pady=10)
         
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=15, width=120, 
-                                                 font=('Consolas', 9))
+        self.log_text = scrolledtext.ScrolledText(log_frame, height=12, width=60, 
+                                                 font=('Consolas', 8))
         self.log_text.pack(fill='both', expand=True, padx=10, pady=10)
+    
+    def create_data_preview_tabs(self, parent):
+        """Create the data preview tabs in the right panel."""
+        # Create notebook for data preview tabs
+        self.preview_notebook = ttk.Notebook(parent)
+        self.preview_notebook.pack(fill='both', expand=True)
+        
+        # Tab 1: Parameter File Preview
+        self.param_tab = ttk.Frame(self.preview_notebook)
+        self.preview_notebook.add(self.param_tab, text="📋 Parameter File")
+        self.create_param_preview_tab(self.param_tab)
+        
+        # Tab 2: Feature Matrix Preview
+        self.matrix_tab = ttk.Frame(self.preview_notebook)
+        self.preview_notebook.add(self.matrix_tab, text="📈 Feature Matrix")
+        self.create_matrix_preview_tab(self.matrix_tab)
+        
+        # Tab 3: Full Feature Matrix (Combined)
+        self.combined_tab = ttk.Frame(self.preview_notebook)
+        self.preview_notebook.add(self.combined_tab, text="🔗 Full Feature Matrix")
+        self.create_combined_preview_tab(self.combined_tab)
+        
+        # Tab 4: Load Full Feature Matrix
+        self.load_tab = ttk.Frame(self.preview_notebook)
+        self.preview_notebook.add(self.load_tab, text="📁 Load Full Matrix")
+        self.create_load_preview_tab(self.load_tab)
+    
+    def create_param_preview_tab(self, parent):
+        """Create parameter file preview tab."""
+        # Info frame
+        info_frame = tk.Frame(parent)
+        info_frame.pack(fill='x', padx=10, pady=5)
+        
+        self.param_info_label = tk.Label(info_frame, text="No parameter file loaded", 
+                                        font=('Arial', 11, 'bold'), fg='#7f8c8d')
+        self.param_info_label.pack(anchor='w')
+        
+        # Table frame with proper scrollbar layout
+        table_frame = tk.Frame(parent)
+        table_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        # Create treeview for data display
+        self.param_tree = ttk.Treeview(table_frame, show='headings', height=20)
+        
+        # Create scrollbars
+        param_v_scroll = ttk.Scrollbar(table_frame, orient='vertical', command=self.param_tree.yview)
+        param_h_scroll = ttk.Scrollbar(table_frame, orient='horizontal', command=self.param_tree.xview)
+        
+        # Configure treeview to use scrollbars
+        self.param_tree.configure(yscrollcommand=param_v_scroll.set, xscrollcommand=param_h_scroll.set)
+        
+        # Grid layout for proper scrollbar positioning
+        table_frame.grid_rowconfigure(0, weight=1)
+        table_frame.grid_columnconfigure(0, weight=1)
+        
+        self.param_tree.grid(row=0, column=0, sticky='nsew')
+        param_v_scroll.grid(row=0, column=1, sticky='ns')
+        param_h_scroll.grid(row=1, column=0, sticky='ew')
+    
+    def create_matrix_preview_tab(self, parent):
+        """Create feature matrix preview tab."""
+        # Info frame
+        info_frame = tk.Frame(parent)
+        info_frame.pack(fill='x', padx=10, pady=5)
+        
+        self.matrix_info_label = tk.Label(info_frame, text="No feature matrix loaded", 
+                                         font=('Arial', 11, 'bold'), fg='#7f8c8d')
+        self.matrix_info_label.pack(anchor='w')
+        
+        # Table frame with proper scrollbar layout
+        table_frame = tk.Frame(parent)
+        table_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        # Create treeview for data display
+        self.matrix_tree = ttk.Treeview(table_frame, show='headings', height=20)
+        
+        # Create scrollbars
+        matrix_v_scroll = ttk.Scrollbar(table_frame, orient='vertical', command=self.matrix_tree.yview)
+        matrix_h_scroll = ttk.Scrollbar(table_frame, orient='horizontal', command=self.matrix_tree.xview)
+        
+        # Configure treeview to use scrollbars
+        self.matrix_tree.configure(yscrollcommand=matrix_v_scroll.set, xscrollcommand=matrix_h_scroll.set)
+        
+        # Grid layout for proper scrollbar positioning
+        table_frame.grid_rowconfigure(0, weight=1)
+        table_frame.grid_columnconfigure(0, weight=1)
+        
+        self.matrix_tree.grid(row=0, column=0, sticky='nsew')
+        matrix_v_scroll.grid(row=0, column=1, sticky='ns')
+        matrix_h_scroll.grid(row=1, column=0, sticky='ew')
+    
+    def create_combined_preview_tab(self, parent):
+        """Create combined data preview tab."""
+        # Info frame
+        info_frame = tk.Frame(parent)
+        info_frame.pack(fill='x', padx=10, pady=5)
+        
+        self.combined_info_label = tk.Label(info_frame, text="No combined data available - process a study first", 
+                                           font=('Arial', 11, 'bold'), fg='#7f8c8d')
+        self.combined_info_label.pack(anchor='w')
+        
+        # Table frame with proper scrollbar layout
+        table_frame = tk.Frame(parent)
+        table_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        # Create treeview for data display
+        self.combined_tree = ttk.Treeview(table_frame, show='headings', height=20)
+        
+        # Create scrollbars
+        combined_v_scroll = ttk.Scrollbar(table_frame, orient='vertical', command=self.combined_tree.yview)
+        combined_h_scroll = ttk.Scrollbar(table_frame, orient='horizontal', command=self.combined_tree.xview)
+        
+        # Configure treeview to use scrollbars
+        self.combined_tree.configure(yscrollcommand=combined_v_scroll.set, xscrollcommand=combined_h_scroll.set)
+        
+        # Grid layout for proper scrollbar positioning
+        table_frame.grid_rowconfigure(0, weight=1)
+        table_frame.grid_columnconfigure(0, weight=1)
+        
+        self.combined_tree.grid(row=0, column=0, sticky='nsew')
+        combined_v_scroll.grid(row=0, column=1, sticky='ns')
+        combined_h_scroll.grid(row=1, column=0, sticky='ew')
+    
+    def create_load_preview_tab(self, parent):
+        """Create load full matrix preview tab."""
+        # Controls frame
+        controls_frame = tk.Frame(parent)
+        controls_frame.pack(fill='x', padx=10, pady=10)
+        
+        tk.Label(controls_frame, text="Load existing Full Feature Matrix:", 
+                font=('Arial', 12, 'bold')).pack(anchor='w')
+        
+        load_button_frame = tk.Frame(controls_frame)
+        load_button_frame.pack(fill='x', pady=10)
+        
+        tk.Button(load_button_frame, text="📁 Browse Full Feature Matrix", 
+                 command=self.browse_full_matrix,
+                 bg='#e67e22', fg='white', font=('Arial', 11, 'bold'),
+                 height=2, width=30).pack(side='left')
+        
+        # Info frame
+        info_frame = tk.Frame(parent)
+        info_frame.pack(fill='x', padx=10, pady=5)
+        
+        self.load_info_label = tk.Label(info_frame, text="No full feature matrix loaded", 
+                                       font=('Arial', 11, 'bold'), fg='#7f8c8d')
+        self.load_info_label.pack(anchor='w')
+        
+        # Table frame with proper scrollbar layout
+        table_frame = tk.Frame(parent)
+        table_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        # Create treeview for data display
+        self.load_tree = ttk.Treeview(table_frame, show='headings', height=20)
+        
+        # Create scrollbars
+        load_v_scroll = ttk.Scrollbar(table_frame, orient='vertical', command=self.load_tree.yview)
+        load_h_scroll = ttk.Scrollbar(table_frame, orient='horizontal', command=self.load_tree.xview)
+        
+        # Configure treeview to use scrollbars
+        self.load_tree.configure(yscrollcommand=load_v_scroll.set, xscrollcommand=load_h_scroll.set)
+        
+        # Grid layout for proper scrollbar positioning
+        table_frame.grid_rowconfigure(0, weight=1)
+        table_frame.grid_columnconfigure(0, weight=1)
+        
+        self.load_tree.grid(row=0, column=0, sticky='nsew')
+        load_v_scroll.grid(row=0, column=1, sticky='ns')
+        load_h_scroll.grid(row=1, column=0, sticky='ew')
+    
+    def populate_data_table(self, tree, data, info_label, max_rows=500):
+        """Populate a treeview with data from a DataFrame."""
+        # Clear existing data
+        for item in tree.get_children():
+            tree.delete(item)
+        
+        if data is None or data.empty:
+            info_label.config(text="No data available", fg='#e74c3c')
+            return
+        
+        # Limit rows for performance
+        display_data = data.head(max_rows)
+        
+        # Configure columns
+        columns = list(display_data.columns)
+        tree['columns'] = columns
+        
+        # Set column headings and widths
+        for col in columns:
+            tree.heading(col, text=col)
+            tree.column(col, width=100, minwidth=50)
+        
+        # Insert data
+        for index, row in display_data.iterrows():
+            values = []
+            for col in columns:
+                value = row[col]
+                # Handle different data types
+                if pd.isna(value):
+                    values.append("")
+                elif isinstance(value, (int, float)):
+                    if isinstance(value, float):
+                        values.append(f"{value:.3f}")
+                    else:
+                        values.append(str(value))
+                else:
+                    values.append(str(value))
+            
+            tree.insert('', 'end', values=values)
+        
+        # Update info label
+        total_rows = len(data)
+        showing_rows = len(display_data)
+        missing_values = data.isnull().sum().sum()
+        
+        info_text = f"📊 Showing {showing_rows:,} of {total_rows:,} rows | {len(columns)} columns | {missing_values:,} missing values"
+        if showing_rows < total_rows:
+            info_text += f" | ⚠️ Limited to first {max_rows:,} rows for performance"
+        
+        info_label.config(text=info_text, fg='#27ae60')
+    
+    def load_param_file_preview(self, filename):
+        """Load and display parameter file preview."""
+        try:
+            self.log_message(f"📋 Loading parameter file preview: {Path(filename).name}")
+            
+            # Auto-detect delimiter
+            with open(filename, 'r') as f:
+                first_line = f.readline()
+                delimiter = '\t' if '\t' in first_line else ','
+            
+            # Load data
+            self.param_data = pd.read_csv(filename, delimiter=delimiter)
+            
+            # Add heeds_design_id for reference
+            self.param_data['heeds_design_id'] = range(1, len(self.param_data) + 1)
+            
+            # Populate table
+            self.populate_data_table(self.param_tree, self.param_data, self.param_info_label)
+            
+            self.log_message(f"   ✅ Parameter preview loaded: {len(self.param_data):,} designs")
+            
+        except Exception as e:
+            error_msg = f"Failed to load parameter preview: {str(e)}"
+            self.log_message(f"❌ {error_msg}")
+            self.param_info_label.config(text=f"❌ Error: {error_msg}", fg='#e74c3c')
+    
+    def load_matrix_file_preview(self, filename):
+        """Load and display feature matrix preview."""
+        try:
+            self.log_message(f"📊 Loading feature matrix preview: {Path(filename).name}")
+            
+            # Load data
+            self.matrix_data = pd.read_csv(filename)
+            
+            # Populate table
+            self.populate_data_table(self.matrix_tree, self.matrix_data, self.matrix_info_label)
+            
+            self.log_message(f"   ✅ Feature matrix preview loaded: {len(self.matrix_data):,} designs")
+            
+        except Exception as e:
+            error_msg = f"Failed to load feature matrix preview: {str(e)}"
+            self.log_message(f"❌ {error_msg}")
+            self.matrix_info_label.config(text=f"❌ Error: {error_msg}", fg='#e74c3c')
+    
+    def browse_full_matrix(self):
+        """Browse for existing full feature matrix file."""
+        filename = filedialog.askopenfilename(
+            title="Select Full Feature Matrix CSV",
+            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")]
+        )
+        if filename:
+            self.load_full_matrix_preview(filename)
+            self.log_message(f"📁 Full feature matrix selected: {Path(filename).name}")
+    
+    def load_full_matrix_preview(self, filename):
+        """Load and display full feature matrix preview."""
+        try:
+            self.log_message(f"📁 Loading full feature matrix preview: {Path(filename).name}")
+            
+            # Load data
+            self.loaded_full_matrix = pd.read_csv(filename)
+            
+            # Populate table
+            self.populate_data_table(self.load_tree, self.loaded_full_matrix, self.load_info_label)
+            
+            self.log_message(f"   ✅ Full feature matrix preview loaded: {len(self.loaded_full_matrix):,} designs")
+            
+        except Exception as e:
+            error_msg = f"Failed to load full feature matrix preview: {str(e)}"
+            self.log_message(f"❌ {error_msg}")
+            self.load_info_label.config(text=f"❌ Error: {error_msg}", fg='#e74c3c')
     
     def browse_param_file(self):
         """Browse for parameter file."""
@@ -842,6 +1255,8 @@ class FeatureMatrixEditorGUI:
         if filename:
             self.param_file_var.set(filename)
             self.log_message(f"📋 Parameter file selected: {Path(filename).name}")
+            # Auto-load preview
+            self.load_param_file_preview(filename)
     
     def browse_matrix_file(self):
         """Browse for feature matrix file."""
@@ -852,6 +1267,8 @@ class FeatureMatrixEditorGUI:
         if filename:
             self.matrix_file_var.set(filename)
             self.log_message(f"📊 Feature matrix selected: {Path(filename).name}")
+            # Auto-load preview
+            self.load_matrix_file_preview(filename)
     
     def browse_heeds_dir(self):
         """Browse for HEEDS directory."""
@@ -977,6 +1394,28 @@ class FeatureMatrixEditorGUI:
         if result:
             self.update_status("✅ Single study processing complete!")
             
+            # Load and display the combined data
+            try:
+                output_file = result['output_file']
+                self.combined_data = pd.read_csv(output_file)
+                
+                # Add cbush_list and cbush_count columns
+                self.combined_data = self.add_cbush_summary_columns(self.combined_data)
+                
+                # Save updated data
+                self.combined_data.to_csv(output_file, index=False)
+                
+                # Display in preview tab
+                self.populate_data_table(self.combined_tree, self.combined_data, self.combined_info_label)
+                
+                # Switch to the combined tab to show results
+                self.preview_notebook.select(self.combined_tab)
+                
+                self.log_message(f"   📊 Combined data preview updated: {len(self.combined_data):,} designs")
+                
+            except Exception as e:
+                self.log_message(f"⚠️ Could not load combined data preview: {str(e)}")
+            
             # Validate if requested
             if self.validate_var.get():
                 self.log_message("🔍 Validating dataset...")
@@ -1009,6 +1448,36 @@ class FeatureMatrixEditorGUI:
         else:
             self.update_status("❌ Processing failed")
             messagebox.showerror("Processing Failed", "Study processing failed. Check the log for details.")
+    
+    def add_cbush_summary_columns(self, df):
+        """Add cbush_list and cbush_count summary columns."""
+        try:
+            def get_loose_cbushes(row):
+                loose_list = []
+                for cbush_num in range(2, 11):
+                    if row[f'cbush_{cbush_num}_loose'] == 1:
+                        loose_list.append(cbush_num)
+                
+                # Format to match original data: "[2 3 4 5 6 7 8 9 10]"
+                if loose_list:
+                    return str(loose_list).replace(',', '')
+                else:
+                    return "[]"
+            
+            # Add cbush_list column
+            df['cbush_list'] = df.apply(get_loose_cbushes, axis=1)
+            
+            # Add cbush_count column
+            cbush_cols = [f'cbush_{i}_loose' for i in range(2, 11) if f'cbush_{i}_loose' in df.columns]
+            df['cbush_count'] = df[cbush_cols].sum(axis=1)
+            
+            self.log_message(f"   ✅ Added cbush_list and cbush_count columns")
+            
+            return df
+            
+        except Exception as e:
+            self.log_message(f"⚠️ Warning: Could not add cbush summary columns: {str(e)}")
+            return df
     
     def _process_failed(self, error_msg):
         """Handle processing failure."""
@@ -1071,6 +1540,27 @@ class FeatureMatrixEditorGUI:
         
         if result:
             self.update_status("✅ Study combination complete!")
+            
+            # Load and display the combined data
+            try:
+                output_file = result['output_file']
+                self.combined_data = pd.read_csv(output_file)
+                
+                # Add cbush_list and cbush_count columns if not present
+                if 'cbush_list' not in self.combined_data.columns:
+                    self.combined_data = self.add_cbush_summary_columns(self.combined_data)
+                    self.combined_data.to_csv(output_file, index=False)
+                
+                # Display in preview tab
+                self.populate_data_table(self.combined_tree, self.combined_data, self.combined_info_label)
+                
+                # Switch to the combined tab to show results
+                self.preview_notebook.select(self.combined_tab)
+                
+                self.log_message(f"   📊 Combined data preview updated: {len(self.combined_data):,} designs")
+                
+            except Exception as e:
+                self.log_message(f"⚠️ Could not load combined data preview: {str(e)}")
             
             # Validate if requested
             if self.validate_var.get():
