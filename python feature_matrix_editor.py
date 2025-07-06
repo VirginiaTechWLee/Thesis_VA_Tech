@@ -15,7 +15,7 @@ Features:
 Usage:
     python feature_matrix_editor.py --help
 
-Author: Enhanced Bolt Detection System
+Author: Wayne Lee
 Version: 1.0
 """
 
