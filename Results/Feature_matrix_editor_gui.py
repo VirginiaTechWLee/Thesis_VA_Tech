@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Feature Matrix Editor V3
-====================
+Feature Matrix Editor v4
+========================
 
 Complete tool for editing and enhancing HEEDS feature matrices with parameter data.
 Handles failed case detection, individual study processing, and multi-study combination.
@@ -10,13 +10,15 @@ Features:
 - Automatic POST_0 folder scanning for failed case detection
 - Individual study processing with full traceability
 - Multi-study combination with global ML IDs
+- User-configurable CBUSH loose detection thresholds
+- Interactive stiffness reference table
 - Comprehensive validation and logging
 
 Usage:
-    python feature_matrix_editor.py --help
+    python feature_matrix_editor_gui_v4.py --help
 
 Author: Enhanced Bolt Detection System
-Version: 1.0
+Version: 4.0
 """
 
 import pandas as pd
@@ -69,8 +71,8 @@ class FeatureMatrixEditor:
             7: 1e10,  # tight
             8: 1e11,  # tight
             9: 1e12,  # very tight
-            # 10: 1e13, # extremely tight (unseen)
-            # 11: 1e14, # extremely tight (unseen)
+            10: 1e13, # approaching validation limit
+            11: 1e14, # validated healthy (beam study confirmed)
         }
         
         self.log("🚀 Feature Matrix Editor Initialized")
@@ -333,7 +335,7 @@ class FeatureMatrixEditor:
             self.failed_operations.append(error_msg)
             return None, None, None
     
-    def merge_parameter_features(self, param_df, feature_df, study_name):
+    def merge_parameter_features(self, param_df, feature_df, study_name, user_threshold=1e8):
         """
         Merge filtered parameter and feature data with traceability.
         
@@ -341,6 +343,7 @@ class FeatureMatrixEditor:
             param_df: Filtered parameter dataframe
             feature_df: Filtered feature dataframe
             study_name: Study name for identification
+            user_threshold: User-defined threshold for loose detection
             
         Returns:
             pd.DataFrame: Merged enhanced dataset
@@ -379,7 +382,7 @@ class FeatureMatrixEditor:
             merged_df = merged_df[available_columns]
             
             # Apply parameter-based CBUSH loose detection (replace simulation-based)
-            merged_df = self.add_parameter_based_cbush_detection(merged_df)
+            merged_df = self.add_parameter_based_cbush_detection(merged_df, user_threshold)
             
             self.log(f"   ✅ Merged dataset: {len(merged_df):,} designs")
             self.log(f"   📊 Total columns: {len(merged_df.columns)}")
@@ -395,9 +398,9 @@ class FeatureMatrixEditor:
             self.failed_operations.append(error_msg)
             return None
     
-    def add_parameter_based_cbush_detection(self, df):
+    def add_parameter_based_cbush_detection(self, df, user_threshold=1e8):
         """
-        Add parameter-based CBUSH loose detection using conservative threshold (< 1e5).
+        Add parameter-based CBUSH loose detection using user-defined threshold.
         
         IMPORTANT: This replaces the simulation-based cbush_X_loose columns which appear
         to have incorrect results (high stiffness CBUSHes showing as loose).
@@ -408,12 +411,13 @@ class FeatureMatrixEditor:
         
         Args:
             df: DataFrame with parameter columns (K4_X, K5_X, K6_X)
+            user_threshold: User-defined threshold for loose detection (default 1e8)
             
         Returns:
             DataFrame with updated cbush_X_loose columns
         """
         try:
-            self.log("🔧 Applying parameter-based CBUSH loose detection (conservative < 1e5)...")
+            self.log(f"🔧 Applying parameter-based CBUSH loose detection (threshold < {user_threshold:.0e})...")
             
             # Keep original simulation-based columns for comparison
             simulation_cols = [col for col in df.columns if col.startswith('cbush_') and col.endswith('_loose')]
@@ -424,48 +428,51 @@ class FeatureMatrixEditor:
             # Apply parameter-based logic
             loose_count_by_cbush = {}
             
-            for cbush_num in range(1, 11):
-                if cbush_num == 1:
-                    # CBUSH 1 always tight (constant at industry standard K=5=1e8)
-                    df[f'cbush_{cbush_num}_loose'] = 0
-                    loose_count_by_cbush[cbush_num] = 0
-                else:
-                    # CBUSHes 2-10: Check parameter values
-                    k4_col = f'K4_{cbush_num}'
-                    k5_col = f'K5_{cbush_num}'
-                    k6_col = f'K6_{cbush_num}'
-                    
-                    if all(col in df.columns for col in [k4_col, k5_col, k6_col]):
-                        def is_loose_conservative(row):
-                            """Conservative loose detection: minimum stiffness < 1e5"""
-                            k4_stiffness = self.stiffness_mapping.get(row[k4_col], 1e8)
-                            k5_stiffness = self.stiffness_mapping.get(row[k5_col], 1e8) 
-                            k6_stiffness = self.stiffness_mapping.get(row[k6_col], 1e8)
-                            
-                            min_stiffness = min(k4_stiffness, k5_stiffness, k6_stiffness)
-                            return 1 if min_stiffness < 1e5 else 0
+            for cbush_num in range(2, 11):  # CBUSHes 2-10 only (omit CBUSH 1)
+                # CBUSHes 2-10: Check parameter values
+                k4_col = f'K4_{cbush_num}'
+                k5_col = f'K5_{cbush_num}'
+                k6_col = f'K6_{cbush_num}'
+                
+                if all(col in df.columns for col in [k4_col, k5_col, k6_col]):
+                    def is_loose_user_defined(row):
+                        """User-defined loose detection: minimum stiffness < user_threshold"""
+                        k4_stiffness = self.stiffness_mapping.get(row[k4_col], 1e8)
+                        k5_stiffness = self.stiffness_mapping.get(row[k5_col], 1e8) 
+                        k6_stiffness = self.stiffness_mapping.get(row[k6_col], 1e8)
                         
-                        df[f'cbush_{cbush_num}_loose'] = df.apply(is_loose_conservative, axis=1)
-                        loose_count = df[f'cbush_{cbush_num}_loose'].sum()
-                        loose_count_by_cbush[cbush_num] = loose_count
-                    else:
-                        self.log(f"   ⚠️  Missing parameter columns for CBUSH {cbush_num}, keeping original")
-                        loose_count_by_cbush[cbush_num] = df.get(f'cbush_{cbush_num}_loose', pd.Series([0])).sum()
+                        min_stiffness = min(k4_stiffness, k5_stiffness, k6_stiffness)
+                        return 1 if min_stiffness < user_threshold else 0
+                    
+                    df[f'cbush_{cbush_num}_loose'] = df.apply(is_loose_user_defined, axis=1)
+                    loose_count = df[f'cbush_{cbush_num}_loose'].sum()
+                    loose_count_by_cbush[cbush_num] = loose_count
+                else:
+                    self.log(f"   ⚠️  Missing parameter columns for CBUSH {cbush_num}, keeping original")
+                    loose_count_by_cbush[cbush_num] = df.get(f'cbush_{cbush_num}_loose', pd.Series([0])).sum()
+            
+            # CBUSH 1 is omitted as requested (stays constant)
+            if 'cbush_1_loose' in df.columns:
+                loose_count_by_cbush[1] = df['cbush_1_loose'].sum()
             
             # Log the new distribution
             self.log("   📊 Parameter-based CBUSH loose distribution:")
+            self.log(f"   🎯 Using threshold: {user_threshold:.0e} (below this = loose)")
             total_designs = len(df)
             for cbush_num in range(1, 11):
                 if cbush_num in loose_count_by_cbush:
                     count = loose_count_by_cbush[cbush_num]
                     percentage = (count / total_designs * 100) if total_designs > 0 else 0
-                    self.log(f"      CBUSH {cbush_num}: {count:,} loose ({percentage:.1f}%)")
+                    if cbush_num == 1:
+                        self.log(f"      CBUSH {cbush_num}: {count:,} loose ({percentage:.1f}%) - CONSTANT")
+                    else:
+                        self.log(f"      CBUSH {cbush_num}: {count:,} loose ({percentage:.1f}%)")
             
             self.log("   ✅ Parameter-based CBUSH detection complete")
             
             # Add documentation columns
-            df['cbush_detection_method'] = 'parameter_based_conservative'
-            df['loose_threshold'] = '< 1e5'
+            df['cbush_detection_method'] = 'parameter_based_user_threshold'
+            df[f'loose_threshold'] = f'< {user_threshold:.0e}'
             
             return df
             
@@ -475,7 +482,7 @@ class FeatureMatrixEditor:
             self.failed_operations.append(error_msg)
             return df
     
-    def process_single_study(self, param_file, matrix_file, heeds_directory, study_name=None, output_name=None):
+    def process_single_study(self, param_file, matrix_file, heeds_directory, study_name=None, output_name=None, user_threshold=1e8):
         """
         Process a single study: parameter file + feature matrix + POST_0 validation.
         
@@ -485,6 +492,7 @@ class FeatureMatrixEditor:
             heeds_directory: Path to HEEDS directory with POST_0
             study_name: Optional study name
             output_name: Optional output filename
+            user_threshold: User-defined threshold for loose detection
             
         Returns:
             dict: Processing results
@@ -517,7 +525,7 @@ class FeatureMatrixEditor:
             
             # Step 5: Merge parameter and feature data
             study_name = study_name or param_info['study_name']
-            merged_df = self.merge_parameter_features(filtered_param_df, filtered_feature_df, study_name)
+            merged_df = self.merge_parameter_features(filtered_param_df, filtered_feature_df, study_name, user_threshold)
             if merged_df is None:
                 return None
             
@@ -543,6 +551,7 @@ class FeatureMatrixEditor:
                 'parameter_count': len([col for col in merged_df.columns if col in self.parameter_columns]),
                 'feature_count': len([col for col in merged_df.columns if col.startswith(('ACCE_', 'DISP_'))]),
                 'cbush_count': len([col for col in merged_df.columns if col.startswith('cbush_') and col.endswith('_loose')]),
+                'user_threshold': user_threshold,
                 'processing_timestamp': datetime.now().isoformat()
             }
             
@@ -774,6 +783,7 @@ class FeatureMatrixEditor:
                     f.write(f"  Designs: {summary['final_dataset_shape'][0]:,}\n")
                     f.write(f"  Columns: {summary['final_dataset_shape'][1]}\n")
                     f.write(f"  Alignment: {summary['alignment_stats']['alignment_rate']:.1%}\n")
+                    f.write(f"  Threshold: {summary.get('user_threshold', 'N/A')}\n")
                     f.write(f"  Output: {summary['output_file']}\n\n")
             
             f.write("PROCESSING LOG:\n")
@@ -799,7 +809,7 @@ class FeatureMatrixEditorGUI:
     def __init__(self, root):
         """Initialize the GUI."""
         self.root = root
-        self.root.title("Feature Matrix Editor v1.0")
+        self.root.title("Feature Matrix Editor v4.0")
         self.root.geometry("1400x900")
         self.root.configure(bg='#f0f0f0')
         
@@ -814,6 +824,14 @@ class FeatureMatrixEditorGUI:
         self.output_dir_var = tk.StringVar(value="edited_output")
         self.study_name_var = tk.StringVar()
         self.validate_var = tk.BooleanVar(value=True)
+        self.threshold_var = tk.StringVar(value="1e8")  # Default to industry standard
+        self.custom_threshold_var = tk.StringVar()
+        
+        # Stiffness mapping for reference table
+        self.stiffness_mapping = {
+            1: 1e4, 2: 1e5, 3: 1e6, 4: 1e7, 5: 1e8, 6: 1e9, 
+            7: 1e10, 8: 1e11, 9: 1e12, 10: 1e13, 11: 1e14
+        }
         
         # Create GUI
         self.create_widgets()
@@ -824,19 +842,22 @@ class FeatureMatrixEditorGUI:
         self.combined_data = None
         self.loaded_full_matrix = None
         
-        self.log_message("🚀 Feature Matrix Editor GUI Ready!")
+        self.log_message("🚀 Feature Matrix Editor v4.0 Ready!")
         self.log_message("📋 Select your files and click 'Process Study' to begin")
     
     def create_widgets(self):
         """Create all GUI widgets."""
         # Title
-        title_label = tk.Label(self.root, text="Feature Matrix Editor", 
+        title_label = tk.Label(self.root, text="Feature Matrix Editor v4.0", 
                               font=('Arial', 20, 'bold'), bg='#f0f0f0', fg='#2c3e50')
         title_label.pack(pady=20)
         
         subtitle_label = tk.Label(self.root, text="HEEDS Parameter-Feature Integration with Traceability",
                                  font=('Arial', 12), bg='#f0f0f0', fg='#7f8c8d')
         subtitle_label.pack(pady=5)
+        
+        # Stiffness Reference Table
+        self.create_stiffness_reference_table()
         
         # Create main container with horizontal layout
         main_container = tk.Frame(self.root)
@@ -855,6 +876,92 @@ class FeatureMatrixEditorGUI:
         
         # Create data preview tabs in right panel
         self.create_data_preview_tabs(right_panel)
+    
+    def create_stiffness_reference_table(self):
+        """Create compact stiffness reference table on main page."""
+        # Stiffness Reference Table (compact)
+        ref_frame = ttk.LabelFrame(self.root, text="📊 Stiffness Reference (Click to Set Threshold)")
+        ref_frame.pack(fill='x', padx=10, pady=5)
+        
+        # Create compact table with scrollable frame
+        canvas = tk.Canvas(ref_frame, height=100)
+        scrollbar = ttk.Scrollbar(ref_frame, orient="horizontal", command=canvas.xview)
+        scrollable_frame = ttk.Frame(canvas)
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(xscrollcommand=scrollbar.set)
+        
+        # Categories for display
+        categories = ["Loose", "Very Loose", "Borderline", "Borderline", "Industry Std", 
+                      "Tight", "Very Tight", "Extremely Tight", "Ultra Tight", "Near Limit", "Validated"]
+        
+        # Create table headers
+        tk.Label(scrollable_frame, text="ID", font=('Arial', 9, 'bold'), relief="solid", borderwidth=1, padx=5).grid(row=0, column=0, sticky='ew')
+        tk.Label(scrollable_frame, text="Stiffness (N·m/rad)", font=('Arial', 9, 'bold'), relief="solid", borderwidth=1, padx=5).grid(row=0, column=1, sticky='ew')
+        tk.Label(scrollable_frame, text="Category", font=('Arial', 9, 'bold'), relief="solid", borderwidth=1, padx=5).grid(row=0, column=2, sticky='ew')
+        
+        # Data rows - make clickable
+        for i, (id_num, stiffness) in enumerate(self.stiffness_mapping.items()):
+            # Create clickable row
+            id_label = tk.Label(scrollable_frame, text=str(id_num), relief="solid", borderwidth=1, padx=5, cursor="hand2")
+            stiff_label = tk.Label(scrollable_frame, text=f"{stiffness:.0e}", relief="solid", borderwidth=1, padx=5, cursor="hand2")
+            cat_label = tk.Label(scrollable_frame, text=categories[i], relief="solid", borderwidth=1, padx=5, cursor="hand2")
+            
+            id_label.grid(row=i+1, column=0, sticky='ew')
+            stiff_label.grid(row=i+1, column=1, sticky='ew')
+            cat_label.grid(row=i+1, column=2, sticky='ew')
+            
+            # Bind click events to set threshold
+            for label in [id_label, stiff_label, cat_label]:
+                label.bind("<Button-1>", lambda e, val=stiffness: self.set_threshold_from_table(val))
+                # Hover effect
+                label.bind("<Enter>", lambda e, lbl=label: lbl.configure(bg='#e8e8e8'))
+                label.bind("<Leave>", lambda e, lbl=label: lbl.configure(bg='SystemButtonFace'))
+        
+        canvas.pack(side="top", fill="x", expand=True, padx=10, pady=5)
+        scrollbar.pack(side="bottom", fill="x", padx=10)
+    
+    def set_threshold_from_table(self, stiffness_value):
+        """Set threshold from clicking on reference table."""
+        self.threshold_var.set(f"{stiffness_value:.0e}")
+        self.log_message(f"🎯 Threshold set to {stiffness_value:.0e} from reference table")
+    
+    def on_threshold_change(self, event=None):
+        """Handle threshold dropdown selection change."""
+        if self.threshold_var.get() == "Custom":
+            self.custom_entry.pack(fill='x', pady=2)
+            self.custom_entry.focus()
+        else:
+            self.custom_entry.pack_forget()
+    
+    def validate_threshold(self, threshold_str):
+        """Validate threshold is valid scientific notation."""
+        try:
+            value = float(threshold_str)
+            if value <= 0:
+                raise ValueError("Threshold must be positive")
+            return value
+        except:
+            raise ValueError(f"Invalid threshold format: {threshold_str}")
+    
+    def get_user_threshold(self):
+        """Get threshold from GUI, with validation."""
+        try:
+            if self.threshold_var.get() == "Custom":
+                if not self.custom_threshold_var.get():
+                    raise ValueError("Custom threshold cannot be empty")
+                return self.validate_threshold(self.custom_threshold_var.get())
+            else:
+                return float(self.threshold_var.get())
+        except Exception as e:
+            # Default to industry standard if error
+            self.log_message(f"⚠️  Threshold error: {str(e)}, using default 1e8")
+            return 1e8
     
     def create_control_widgets(self, parent):
         """Create the control widgets in the left panel."""
@@ -918,6 +1025,30 @@ class FeatureMatrixEditorGUI:
         tk.Checkbutton(options_frame, text="Validate final dataset", variable=self.validate_var,
                       font=('Arial', 10)).pack(anchor='w')
         
+        # CBUSH Loose Detection Threshold
+        threshold_frame = tk.Frame(settings_frame)
+        threshold_frame.pack(fill='x', padx=10, pady=5)
+        tk.Label(threshold_frame, text="CBUSH Loose Threshold:", font=('Arial', 10, 'bold')).pack(anchor='w')
+        
+        # Dropdown with presets
+        threshold_combo = ttk.Combobox(threshold_frame, textvariable=self.threshold_var, 
+                                      values=["1e5", "1e6", "1e7", "1e8", "1e9", "1e10", "1e11", "1e12", "1e13", "1e14", "Custom"],
+                                      width=15, font=('Arial', 9))
+        threshold_combo.pack(fill='x', pady=2)
+        
+        # Custom entry (hidden initially)
+        self.custom_entry = tk.Entry(threshold_frame, textvariable=self.custom_threshold_var, font=('Arial', 9))
+        self.custom_entry.pack(fill='x', pady=2)
+        self.custom_entry.pack_forget()  # Hidden initially
+        
+        # Bind event to show/hide custom entry
+        threshold_combo.bind('<<ComboboxSelected>>', self.on_threshold_change)
+        
+        # Add tooltip explanation
+        tooltip_label = tk.Label(threshold_frame, text="Values below threshold are considered 'loose'", 
+                               font=('Arial', 8), fg='#666666')
+        tooltip_label.pack(anchor='w')
+        
         # Processing controls
         control_frame = ttk.LabelFrame(parent, text="🚀 Processing Controls")
         control_frame.pack(fill='x', pady=10)
@@ -926,13 +1057,13 @@ class FeatureMatrixEditorGUI:
         button_frame.pack(fill='x', padx=10, pady=10)
         
         tk.Button(button_frame, text="🔄 Process Study", command=self.process_single_study,
-                 bg='#27ae60', fg='white', font=('Arial', 11, 'bold'), height=2, width=18).pack(fill='x', pady=2)
+                 bg='#27ae60', fg='white', font=('Arial', 11, 'bold'), height=1, width=18).pack(fill='x', pady=2)
         
         tk.Button(button_frame, text="🔗 Combine Studies", command=self.combine_studies,
-                 bg='#9b59b6', fg='white', font=('Arial', 11, 'bold'), height=2, width=18).pack(fill='x', pady=2)
+                 bg='#9b59b6', fg='white', font=('Arial', 11, 'bold'), height=1, width=18).pack(fill='x', pady=2)
         
         tk.Button(button_frame, text="📋 Clear Log", command=self.clear_log,
-                 bg='#95a5a6', fg='white', font=('Arial', 10, 'bold'), height=1, width=18).pack(fill='x', pady=2)
+                 bg='#95a5a6', fg='white', font=('Arial', 9, 'bold'), height=1, width=18).pack(fill='x', pady=2)
         
         # Progress frame
         progress_frame = ttk.LabelFrame(parent, text="📊 Progress")
@@ -1372,12 +1503,17 @@ class FeatureMatrixEditorGUI:
                 self.root.after(0, lambda: self.log_message(message))
             self.editor.log = gui_log
             
+            # Get user-defined threshold
+            user_threshold = self.get_user_threshold()
+            self.root.after(0, lambda: self.log_message(f"🎯 Using threshold: {user_threshold:.0e}"))
+            
             # Process the study
             result = self.editor.process_single_study(
                 param_file=self.param_file_var.get(),
                 matrix_file=self.matrix_file_var.get(),
                 heeds_directory=self.heeds_dir_var.get(),
-                study_name=self.study_name_var.get() or None
+                study_name=self.study_name_var.get() or None,
+                user_threshold=user_threshold
             )
             
             # Update GUI on main thread
@@ -1439,12 +1575,14 @@ class FeatureMatrixEditorGUI:
             
             # Show success message
             output_file = result['output_file']
+            threshold_used = result.get('user_threshold', 'N/A')
             messagebox.showinfo("Success!", 
                                f"✅ Study processed successfully!\n\n"
                                f"Output: {Path(output_file).name}\n"
                                f"Designs: {result['final_dataset_shape'][0]:,}\n"
                                f"Columns: {result['final_dataset_shape'][1]}\n"
-                               f"Alignment: {result['alignment_stats']['alignment_rate']:.1%}")
+                               f"Alignment: {result['alignment_stats']['alignment_rate']:.1%}\n"
+                               f"Threshold: {threshold_used}")
         else:
             self.update_status("❌ Processing failed")
             messagebox.showerror("Processing Failed", "Study processing failed. Check the log for details.")
@@ -1455,7 +1593,7 @@ class FeatureMatrixEditorGUI:
             def get_loose_cbushes(row):
                 loose_list = []
                 for cbush_num in range(2, 11):
-                    if row[f'cbush_{cbush_num}_loose'] == 1:
+                    if f'cbush_{cbush_num}_loose' in df.columns and row[f'cbush_{cbush_num}_loose'] == 1:
                         loose_list.append(cbush_num)
                 
                 # Format to match original data: "[2 3 4 5 6 7 8 9 10]"
@@ -1613,6 +1751,8 @@ def main():
                            help='Output directory')
         parser.add_argument('--study-name', '-s', default=None,
                            help='Study name override')
+        parser.add_argument('--threshold', '-t', type=float, default=1e8,
+                           help='CBUSH loose threshold (default: 1e8)')
         parser.add_argument('--combine-with', '-c', nargs='+', default=None,
                            help='Additional enhanced study files to combine with')
         parser.add_argument('--validate', '-v', action='store_true',
@@ -1634,7 +1774,8 @@ def main():
                 param_file=args.param,
                 matrix_file=args.matrix,
                 heeds_directory=args.heeds,
-                study_name=args.study_name
+                study_name=args.study_name,
+                user_threshold=args.threshold
             )
             
             if not result:
@@ -1685,6 +1826,7 @@ def main():
             print(f"\n🎉 SUCCESS: Enhanced feature matrix created!")
             print(f"📁 Output directory: {editor.output_dir}")
             print(f"📊 Final dataset: {final_file}")
+            print(f"🎯 Threshold used: {args.threshold}")
             
             if args.validate and validation_result:
                 print(f"🎯 Data quality: {validation_result['data_quality_score']:.1%}")
@@ -1699,7 +1841,7 @@ def main():
     
     else:
         # No command line arguments - run GUI
-        print("🚀 Starting Feature Matrix Editor GUI...")
+        print("🚀 Starting Feature Matrix Editor v4.0 GUI...")
         create_gui()
         return 0
 
