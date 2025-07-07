@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Feature Matrix Editor v4
+Feature Matrix Editor v5
 ========================
 
 Complete tool for editing and enhancing HEEDS feature matrices with parameter data.
@@ -15,10 +15,10 @@ Features:
 - Comprehensive validation and logging
 
 Usage:
-    python feature_matrix_editor_gui_v4.py --help
+    python feature_matrix_editor_gui_v5.py --help
 
 Author: Enhanced Bolt Detection System
-Version: 4.0
+Version: 5.0
 """
 
 import pandas as pd
@@ -324,8 +324,39 @@ class FeatureMatrixEditor:
             self.log(f"   ✅ Final valid designs: {alignment_stats['final_valid']:,}")
             self.log(f"   📈 Alignment rate: {alignment_stats['alignment_rate']:.1%}")
             
+            # Log detailed omission analysis
+            self.log("🔍 Detailed alignment analysis:")
+            
+            # Designs missing from POST_0 success
+            param_but_not_post0 = param_designs - successful_designs
+            if param_but_not_post0:
+                sample_param_missing = sorted(list(param_but_not_post0))[:10]
+                if len(param_but_not_post0) > 10:
+                    self.log(f"   ❌ POST_0 failed: {sample_param_missing} (showing first 10 of {len(param_but_not_post0)})")
+                else:
+                    self.log(f"   ❌ POST_0 failed: {sample_param_missing}")
+            
+            # Designs missing from feature matrix
+            param_but_not_feature = param_designs - feature_designs
+            if param_but_not_feature:
+                sample_feature_missing = sorted(list(param_but_not_feature))[:10]
+                if len(param_but_not_feature) > 10:
+                    self.log(f"   📈 Feature extraction failed: {sample_feature_missing} (showing first 10 of {len(param_but_not_feature)})")
+                else:
+                    self.log(f"   📈 Feature extraction failed: {sample_feature_missing}")
+            
+            # Overall omitted designs (parameter designs that didn't make it to final)
+            omitted_designs = param_designs - valid_designs
+            if omitted_designs:
+                sample_omitted = sorted(list(omitted_designs))[:20]
+                if len(omitted_designs) > 20:
+                    self.log(f"   🚫 Total omitted from final: {sample_omitted} (showing first 20 of {len(omitted_designs)})")
+                else:
+                    self.log(f"   🚫 Total omitted from final: {sorted(list(omitted_designs))}")
+            
             if alignment_stats['alignment_rate'] < 0.8:
                 self.log(f"   ⚠️  LOW ALIGNMENT RATE: {alignment_stats['alignment_rate']:.1%}")
+                self.log(f"   💡 Consider checking: POST_0 simulation stability, feature extraction robustness")
             
             return filtered_param_df, filtered_feature_df, alignment_stats
             
@@ -809,7 +840,7 @@ class FeatureMatrixEditorGUI:
     def __init__(self, root):
         """Initialize the GUI."""
         self.root = root
-        self.root.title("Feature Matrix Editor v4.0")
+        self.root.title("Feature Matrix Editor v5.0")
         self.root.geometry("1400x900")
         self.root.configure(bg='#f0f0f0')
         
@@ -842,13 +873,13 @@ class FeatureMatrixEditorGUI:
         self.combined_data = None
         self.loaded_full_matrix = None
         
-        self.log_message("🚀 Feature Matrix Editor v4.0 Ready!")
+        self.log_message("🚀 Feature Matrix Editor v5.0 Ready!")
         self.log_message("📋 Select your files and click 'Process Study' to begin")
     
     def create_widgets(self):
         """Create all GUI widgets."""
         # Title
-        title_label = tk.Label(self.root, text="Feature Matrix Editor v4.0", 
+        title_label = tk.Label(self.root, text="Feature Matrix Editor v5.0", 
                               font=('Arial', 20, 'bold'), bg='#f0f0f0', fg='#2c3e50')
         title_label.pack(pady=20)
         
@@ -878,14 +909,27 @@ class FeatureMatrixEditorGUI:
         self.create_data_preview_tabs(right_panel)
     
     def create_stiffness_reference_table(self):
-        """Create compact stiffness reference table on main page."""
-        # Stiffness Reference Table (compact)
-        ref_frame = ttk.LabelFrame(self.root, text="📊 Stiffness Reference (Click to Set Threshold)")
-        ref_frame.pack(fill='x', padx=10, pady=5)
+        """Create collapsible stiffness reference table on main page."""
+        # Stiffness Reference Table (collapsible)
+        self.ref_frame = ttk.LabelFrame(self.root, text="📊 Stiffness Reference (Click to Set Threshold)")
+        self.ref_frame.pack(fill='x', padx=10, pady=5)
+        
+        # Collapse/Expand button
+        button_frame = tk.Frame(self.ref_frame)
+        button_frame.pack(fill='x', padx=5, pady=2)
+        
+        self.table_expanded = tk.BooleanVar(value=True)
+        self.expand_button = tk.Button(button_frame, text="▼ Hide Table", command=self.toggle_table,
+                                      font=('Arial', 8), bg='#ecf0f1', relief='flat')
+        self.expand_button.pack(side='left')
+        
+        # Table container (collapsible)
+        self.table_container = tk.Frame(self.ref_frame)
+        self.table_container.pack(fill='x', padx=5, pady=5)
         
         # Create compact table with scrollable frame
-        canvas = tk.Canvas(ref_frame, height=100)
-        scrollbar = ttk.Scrollbar(ref_frame, orient="horizontal", command=canvas.xview)
+        canvas = tk.Canvas(self.table_container, height=120)
+        scrollbar = ttk.Scrollbar(self.table_container, orient="horizontal", command=canvas.xview)
         scrollable_frame = ttk.Frame(canvas)
         
         scrollable_frame.bind(
@@ -923,8 +967,21 @@ class FeatureMatrixEditorGUI:
                 label.bind("<Enter>", lambda e, lbl=label: lbl.configure(bg='#e8e8e8'))
                 label.bind("<Leave>", lambda e, lbl=label: lbl.configure(bg='SystemButtonFace'))
         
-        canvas.pack(side="top", fill="x", expand=True, padx=10, pady=5)
-        scrollbar.pack(side="bottom", fill="x", padx=10)
+        canvas.pack(side="top", fill="x", expand=True, padx=5, pady=5)
+        scrollbar.pack(side="bottom", fill="x", padx=5)
+    
+    def toggle_table(self):
+        """Toggle visibility of stiffness reference table."""
+        if self.table_expanded.get():
+            # Collapse table
+            self.table_container.pack_forget()
+            self.expand_button.config(text="▶ Show Table")
+            self.table_expanded.set(False)
+        else:
+            # Expand table
+            self.table_container.pack(fill='x', padx=5, pady=5)
+            self.expand_button.config(text="▼ Hide Table")
+            self.table_expanded.set(True)
     
     def set_threshold_from_table(self, stiffness_value):
         """Set threshold from clicking on reference table."""
@@ -962,6 +1019,280 @@ class FeatureMatrixEditorGUI:
             # Default to industry standard if error
             self.log_message(f"⚠️  Threshold error: {str(e)}, using default 1e8")
             return 1e8
+    
+    def update_scaling_description(self, event=None):
+        """Update scaling method description."""
+        method = self.scaling_method_var.get()
+        descriptions = {
+            "StandardScaler": "Mean=0, Std=1 (best for most ML algorithms)",
+            "MinMaxScaler": "Scale to 0-1 range (preserves relationships)", 
+            "RobustScaler": "Median-based, robust to outliers",
+            "MaxAbsScaler": "Scale by maximum absolute value",
+            "Normalizer": "Scale individual samples to unit norm"
+        }
+        self.method_desc_label.config(text=descriptions.get(method, "Unknown scaling method"))
+    
+    def apply_scaling(self):
+        """Apply scaling to selected features."""
+        if self.combined_data is None:
+            messagebox.showwarning("No Data", "Please process a study first to enable scaling")
+            return
+        
+        try:
+            # Import scaling modules
+            from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler, MaxAbsScaler, Normalizer
+            import numpy as np
+            
+            # Get scaling method
+            method_name = self.scaling_method_var.get()
+            scalers = {
+                "StandardScaler": StandardScaler(),
+                "MinMaxScaler": MinMaxScaler(),
+                "RobustScaler": RobustScaler(),
+                "MaxAbsScaler": MaxAbsScaler(),
+                "Normalizer": Normalizer()
+            }
+            
+            scaler = scalers[method_name]
+            
+            # Identify columns to scale
+            columns_to_scale = []
+            
+            if self.scale_params_var.get():
+                param_cols = [col for col in self.combined_data.columns if col.startswith(('K4_', 'K5_', 'K6_'))]
+                columns_to_scale.extend(param_cols)
+            
+            if self.scale_features_var.get():
+                feature_cols = [col for col in self.combined_data.columns if col.startswith(('ACCE_', 'DISP_'))]
+                columns_to_scale.extend(feature_cols)
+            
+            if self.scale_cbush_var.get():
+                cbush_cols = [col for col in self.combined_data.columns if col.startswith('cbush_') and col.endswith('_loose')]
+                columns_to_scale.extend(cbush_cols)
+            
+            if not columns_to_scale:
+                messagebox.showwarning("No Columns", "Please select at least one column type to scale")
+                return
+            
+            # Create scaled copy
+            self.scaled_data = self.combined_data.copy()
+            
+            # Apply scaling
+            scaled_values = scaler.fit_transform(self.combined_data[columns_to_scale])
+            self.scaled_data[columns_to_scale] = scaled_values
+            
+            # Show before/after statistics
+            self.show_scaling_comparison(columns_to_scale[:10])  # Show first 10 for brevity
+            
+            self.log_message(f"✅ Applied {method_name} to {len(columns_to_scale)} columns")
+            
+        except ImportError:
+            messagebox.showerror("Missing Library", "sklearn not installed. Please install: pip install scikit-learn")
+        except Exception as e:
+            messagebox.showerror("Scaling Error", f"Failed to apply scaling: {str(e)}")
+    
+    def show_scaling_comparison(self, sample_columns):
+        """Show before/after scaling statistics."""
+        if self.combined_data is None or not hasattr(self, 'scaled_data'):
+            return
+        
+        # Clear previous results
+        self.before_scaling_text.delete('1.0', tk.END)
+        self.after_scaling_text.delete('1.0', tk.END)
+        
+        # Before scaling statistics
+        self.before_scaling_text.insert(tk.END, "BEFORE SCALING STATISTICS:\n")
+        self.before_scaling_text.insert(tk.END, "=" * 40 + "\n\n")
+        
+        for col in sample_columns:
+            if col in self.combined_data.columns:
+                data = self.combined_data[col]
+                stats = f"{col}:\n"
+                stats += f"  Mean: {data.mean():.4f}\n"
+                stats += f"  Std:  {data.std():.4f}\n"
+                stats += f"  Min:  {data.min():.4f}\n"
+                stats += f"  Max:  {data.max():.4f}\n\n"
+                self.before_scaling_text.insert(tk.END, stats)
+        
+        # After scaling statistics
+        self.after_scaling_text.insert(tk.END, "AFTER SCALING STATISTICS:\n")
+        self.after_scaling_text.insert(tk.END, "=" * 40 + "\n\n")
+        
+        for col in sample_columns:
+            if col in self.scaled_data.columns:
+                data = self.scaled_data[col]
+                stats = f"{col}:\n"
+                stats += f"  Mean: {data.mean():.4f}\n"
+                stats += f"  Std:  {data.std():.4f}\n"
+                stats += f"  Min:  {data.min():.4f}\n"
+                stats += f"  Max:  {data.max():.4f}\n\n"
+                self.after_scaling_text.insert(tk.END, stats)
+    
+    def save_scaled_data(self):
+        """Save scaled data to file."""
+        if not hasattr(self, 'scaled_data'):
+            messagebox.showwarning("No Scaled Data", "Please apply scaling first")
+            return
+        
+        # Get save filename
+        filename = filedialog.asksaveasfilename(
+            title="Save Scaled Dataset",
+            defaultextension=".csv",
+            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")]
+        )
+        
+        if filename:
+            try:
+                self.scaled_data.to_csv(filename, index=False)
+                self.log_message(f"💾 Scaled data saved: {Path(filename).name}")
+                messagebox.showinfo("Success", f"Scaled data saved successfully!\n\n{Path(filename).name}")
+            except Exception as e:
+                messagebox.showerror("Save Error", f"Failed to save scaled data: {str(e)}")
+    
+    def generate_correlation(self):
+        """Generate correlation matrix for selected features."""
+        if self.combined_data is None:
+            messagebox.showwarning("No Data", "Please process a study first")
+            return
+        
+        try:
+            # Use scaled data if available, otherwise original
+            data = self.scaled_data if hasattr(self, 'scaled_data') else self.combined_data
+            
+            # Get target variable
+            target = self.correlation_target_var.get()
+            if target not in data.columns:
+                messagebox.showwarning("Invalid Target", f"Target '{target}' not found in data")
+                return
+            
+            # Identify columns to include
+            columns_to_analyze = [target]  # Always include target
+            
+            if self.corr_params_var.get():
+                param_cols = [col for col in data.columns if col.startswith(('K4_', 'K5_', 'K6_'))]
+                columns_to_analyze.extend(param_cols)
+            
+            if self.corr_features_var.get():
+                feature_cols = [col for col in data.columns if col.startswith(('ACCE_', 'DISP_'))]
+                columns_to_analyze.extend(feature_cols)
+            
+            if self.corr_cbush_var.get():
+                cbush_cols = [col for col in data.columns if col.startswith('cbush_') and col.endswith('_loose')]
+                columns_to_analyze.extend(cbush_cols)
+            
+            # Remove duplicates and ensure target is included
+            columns_to_analyze = list(set(columns_to_analyze))
+            
+            if len(columns_to_analyze) < 2:
+                messagebox.showwarning("Insufficient Columns", "Select at least one feature type for correlation analysis")
+                return
+            
+            # Calculate correlations with target
+            correlations = data[columns_to_analyze].corr()[target].drop(target).abs().sort_values(ascending=False)
+            
+            # Display results
+            self.correlation_text.delete('1.0', tk.END)
+            self.correlation_text.insert(tk.END, f"CORRELATION WITH {target}:\n")
+            self.correlation_text.insert(tk.END, "=" * 50 + "\n\n")
+            
+            data_source = "SCALED DATA" if hasattr(self, 'scaled_data') else "RAW DATA"
+            self.correlation_text.insert(tk.END, f"Source: {data_source}\n")
+            self.correlation_text.insert(tk.END, f"Features analyzed: {len(columns_to_analyze)-1}\n\n")
+            
+            self.correlation_text.insert(tk.END, "TOP CORRELATIONS:\n")
+            self.correlation_text.insert(tk.END, "-" * 30 + "\n")
+            
+            for feature, corr_value in correlations.head(20).items():
+                self.correlation_text.insert(tk.END, f"{feature:<25} {corr_value:.4f}\n")
+            
+            self.log_message(f"🔥 Generated correlation matrix for {target}")
+            
+        except Exception as e:
+            messagebox.showerror("Correlation Error", f"Failed to generate correlation matrix: {str(e)}")
+    
+    def generate_ai_suggestions(self):
+        """Generate AI-powered feature suggestions."""
+        if self.combined_data is None:
+            messagebox.showwarning("No Data", "Please process a study first")
+            return
+        
+        try:
+            # Use scaled data if available, otherwise original
+            data = self.scaled_data if hasattr(self, 'scaled_data') else self.combined_data
+            
+            # Get target variable
+            target = self.correlation_target_var.get()
+            if target not in data.columns:
+                messagebox.showwarning("Invalid Target", f"Target '{target}' not found in data")
+                return
+            
+            # Calculate correlations
+            numeric_data = data.select_dtypes(include=[np.number])
+            if target not in numeric_data.columns:
+                messagebox.showwarning("Invalid Target", f"Target '{target}' is not numeric")
+                return
+            
+            correlations = numeric_data.corr()[target].drop(target).abs().sort_values(ascending=False)
+            
+            # Generate AI insights
+            self.ai_suggestions_text.delete('1.0', tk.END)
+            self.ai_suggestions_text.insert(tk.END, f"🧠 AI INSIGHTS FOR {target}:\n")
+            self.ai_suggestions_text.insert(tk.END, "=" * 50 + "\n\n")
+            
+            data_source = "SCALED" if hasattr(self, 'scaled_data') else "RAW"
+            self.ai_suggestions_text.insert(tk.END, f"Analysis of: {data_source} DATA\n\n")
+            
+            # Top overall features
+            top_feature = correlations.index[0]
+            top_corr = correlations.iloc[0]
+            
+            self.ai_suggestions_text.insert(tk.END, "🎯 TOP RECOMMENDATION:\n")
+            self.ai_suggestions_text.insert(tk.END, f"Feature: {top_feature}\n")
+            self.ai_suggestions_text.insert(tk.END, f"Correlation: {top_corr:.4f}\n\n")
+            
+            # Categorized suggestions
+            param_features = [f for f in correlations.index if f.startswith(('K4_', 'K5_', 'K6_'))]
+            accel_features = [f for f in correlations.index if f.startswith('ACCE_')]
+            disp_features = [f for f in correlations.index if f.startswith('DISP_')]
+            
+            if param_features:
+                self.ai_suggestions_text.insert(tk.END, "🔧 TOP PARAMETERS:\n")
+                for feat in param_features[:3]:
+                    self.ai_suggestions_text.insert(tk.END, f"  {feat}: {correlations[feat]:.4f}\n")
+                self.ai_suggestions_text.insert(tk.END, "\n")
+            
+            if accel_features:
+                self.ai_suggestions_text.insert(tk.END, "📈 TOP ACCELERATIONS:\n")
+                for feat in accel_features[:3]:
+                    self.ai_suggestions_text.insert(tk.END, f"  {feat}: {correlations[feat]:.4f}\n")
+                self.ai_suggestions_text.insert(tk.END, "\n")
+            
+            if disp_features:
+                self.ai_suggestions_text.insert(tk.END, "📏 TOP DISPLACEMENTS:\n")
+                for feat in disp_features[:3]:
+                    self.ai_suggestions_text.insert(tk.END, f"  {feat}: {correlations[feat]:.4f}\n")
+                self.ai_suggestions_text.insert(tk.END, "\n")
+            
+            # AI interpretation
+            self.ai_suggestions_text.insert(tk.END, "💡 AI INTERPRETATION:\n")
+            if top_feature.startswith(('K4_', 'K5_', 'K6_')):
+                self.ai_suggestions_text.insert(tk.END, f"The stiffness parameter {top_feature} shows strongest correlation.\n")
+                self.ai_suggestions_text.insert(tk.END, "This suggests the bolt's inherent stiffness directly impacts looseness.\n")
+            elif top_feature.startswith('ACCE_'):
+                self.ai_suggestions_text.insert(tk.END, f"Acceleration response {top_feature} is most predictive.\n")
+                self.ai_suggestions_text.insert(tk.END, "Dynamic response patterns reveal structural behavior changes.\n")
+            elif top_feature.startswith('DISP_'):
+                self.ai_suggestions_text.insert(tk.END, f"Displacement response {top_feature} is most predictive.\n")
+                self.ai_suggestions_text.insert(tk.END, "Structural deformation patterns indicate loose connections.\n")
+            
+            # Update target combo with available targets
+            cbush_targets = [col for col in data.columns if col.startswith('cbush_') and col.endswith('_loose')]
+            self.target_combo['values'] = cbush_targets
+            
+            self.log_message(f"🧠 Generated AI suggestions for {target}")
+            
+        except Exception as e:
+            messagebox.showerror("AI Analysis Error", f"Failed to generate AI suggestions: {str(e)}")
     
     def create_control_widgets(self, parent):
         """Create the control widgets in the left panel."""
@@ -1106,7 +1437,17 @@ class FeatureMatrixEditorGUI:
         self.preview_notebook.add(self.combined_tab, text="🔗 Full Feature Matrix")
         self.create_combined_preview_tab(self.combined_tab)
         
-        # Tab 4: Load Full Feature Matrix
+        # Tab 4: Feature Scaling
+        self.scaling_tab = ttk.Frame(self.preview_notebook)
+        self.preview_notebook.add(self.scaling_tab, text="📏 Feature Scaling")
+        self.create_scaling_tab(self.scaling_tab)
+        
+        # Tab 5: Correlation Matrix
+        self.correlation_tab = ttk.Frame(self.preview_notebook)
+        self.preview_notebook.add(self.correlation_tab, text="🔥 Correlation Matrix")
+        self.create_correlation_tab(self.correlation_tab)
+        
+        # Tab 6: Load Full Feature Matrix
         self.load_tab = ttk.Frame(self.preview_notebook)
         self.preview_notebook.add(self.load_tab, text="📁 Load Full Matrix")
         self.create_load_preview_tab(self.load_tab)
@@ -1253,6 +1594,155 @@ class FeatureMatrixEditorGUI:
         self.load_tree.grid(row=0, column=0, sticky='nsew')
         load_v_scroll.grid(row=0, column=1, sticky='ns')
         load_h_scroll.grid(row=1, column=0, sticky='ew')
+    
+    def create_scaling_tab(self, parent):
+        """Create feature scaling tab."""
+        # Controls frame
+        controls_frame = ttk.LabelFrame(parent, text="📏 Feature Scaling Options")
+        controls_frame.pack(fill='x', padx=10, pady=10)
+        
+        # Scaling method selection
+        method_frame = tk.Frame(controls_frame)
+        method_frame.pack(fill='x', padx=10, pady=5)
+        
+        tk.Label(method_frame, text="Scaling Method:", font=('Arial', 10, 'bold')).pack(anchor='w')
+        
+        self.scaling_method_var = tk.StringVar(value="StandardScaler")
+        scaling_methods = ["StandardScaler", "MinMaxScaler", "RobustScaler", "MaxAbsScaler", "Normalizer"]
+        method_combo = ttk.Combobox(method_frame, textvariable=self.scaling_method_var, 
+                                   values=scaling_methods, width=15, font=('Arial', 9))
+        method_combo.pack(fill='x', pady=2)
+        
+        # Method descriptions
+        method_desc_frame = tk.Frame(controls_frame)
+        method_desc_frame.pack(fill='x', padx=10, pady=5)
+        
+        self.method_desc_label = tk.Label(method_desc_frame, text="StandardScaler: Mean=0, Std=1 (best for ML)", 
+                                         font=('Arial', 9), fg='#666666', wraplength=400)
+        self.method_desc_label.pack(anchor='w')
+        
+        # Bind method change to update description
+        method_combo.bind('<<ComboboxSelected>>', self.update_scaling_description)
+        
+        # Column selection frame
+        selection_frame = ttk.LabelFrame(controls_frame, text="Select Columns to Scale")
+        selection_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        # Column type checkboxes
+        type_frame = tk.Frame(selection_frame)
+        type_frame.pack(fill='x', padx=10, pady=5)
+        
+        self.scale_params_var = tk.BooleanVar(value=False)
+        self.scale_features_var = tk.BooleanVar(value=True)
+        self.scale_cbush_var = tk.BooleanVar(value=False)
+        
+        tk.Checkbutton(type_frame, text="Parameters (K4_X, K5_X, K6_X)", variable=self.scale_params_var,
+                      font=('Arial', 10)).pack(anchor='w')
+        tk.Checkbutton(type_frame, text="Features (ACCE_X, DISP_X)", variable=self.scale_features_var,
+                      font=('Arial', 10)).pack(anchor='w')
+        tk.Checkbutton(type_frame, text="CBUSH Labels (cbush_X_loose)", variable=self.scale_cbush_var,
+                      font=('Arial', 10)).pack(anchor='w')
+        
+        # Action buttons
+        button_frame = tk.Frame(controls_frame)
+        button_frame.pack(fill='x', padx=10, pady=10)
+        
+        tk.Button(button_frame, text="📏 Scale Selected Features", command=self.apply_scaling,
+                 bg='#e67e22', fg='white', font=('Arial', 11, 'bold'), height=1, width=25).pack(side='left', padx=5)
+        
+        tk.Button(button_frame, text="💾 Save Scaled Data", command=self.save_scaled_data,
+                 bg='#27ae60', fg='white', font=('Arial', 11, 'bold'), height=1, width=20).pack(side='left', padx=5)
+        
+        # Scaling results frame
+        results_frame = ttk.LabelFrame(parent, text="📊 Scaling Results")
+        results_frame.pack(fill='both', expand=True, padx=10, pady=10)
+        
+        # Before/After comparison
+        comparison_frame = tk.Frame(results_frame)
+        comparison_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        # Before scaling (left side)
+        before_frame = ttk.LabelFrame(comparison_frame, text="Before Scaling")
+        before_frame.pack(side='left', fill='both', expand=True, padx=5)
+        
+        self.before_scaling_text = scrolledtext.ScrolledText(before_frame, height=8, width=40, font=('Consolas', 8))
+        self.before_scaling_text.pack(fill='both', expand=True, padx=5, pady=5)
+        
+        # After scaling (right side)
+        after_frame = ttk.LabelFrame(comparison_frame, text="After Scaling")
+        after_frame.pack(side='right', fill='both', expand=True, padx=5)
+        
+        self.after_scaling_text = scrolledtext.ScrolledText(after_frame, height=8, width=40, font=('Consolas', 8))
+        self.after_scaling_text.pack(fill='both', expand=True, padx=5, pady=5)
+        
+        # Initialize with default description
+        self.update_scaling_description()
+    
+    def create_correlation_tab(self, parent):
+        """Create correlation matrix tab."""
+        # Controls frame
+        controls_frame = ttk.LabelFrame(parent, text="🔥 Correlation Analysis")
+        controls_frame.pack(fill='x', padx=10, pady=10)
+        
+        # Target selection
+        target_frame = tk.Frame(controls_frame)
+        target_frame.pack(fill='x', padx=10, pady=5)
+        
+        tk.Label(target_frame, text="Target Variable:", font=('Arial', 10, 'bold')).pack(anchor='w')
+        
+        self.correlation_target_var = tk.StringVar(value="cbush_2_loose")
+        self.target_combo = ttk.Combobox(target_frame, textvariable=self.correlation_target_var, 
+                                        width=20, font=('Arial', 9))
+        self.target_combo.pack(fill='x', pady=2)
+        
+        # Feature selection checkboxes
+        feature_frame = tk.Frame(controls_frame)
+        feature_frame.pack(fill='x', padx=10, pady=5)
+        
+        tk.Label(feature_frame, text="Include Features:", font=('Arial', 10, 'bold')).pack(anchor='w')
+        
+        self.corr_params_var = tk.BooleanVar(value=True)
+        self.corr_features_var = tk.BooleanVar(value=True)
+        self.corr_cbush_var = tk.BooleanVar(value=True)
+        
+        tk.Checkbutton(feature_frame, text="Parameters (K4_X, K5_X, K6_X)", variable=self.corr_params_var,
+                      font=('Arial', 10)).pack(anchor='w')
+        tk.Checkbutton(feature_frame, text="Features (ACCE_X, DISP_X)", variable=self.corr_features_var,
+                      font=('Arial', 10)).pack(anchor='w')
+        tk.Checkbutton(feature_frame, text="CBUSH Labels (cbush_X_loose)", variable=self.corr_cbush_var,
+                      font=('Arial', 10)).pack(anchor='w')
+        
+        # Analysis buttons
+        button_frame = tk.Frame(controls_frame)
+        button_frame.pack(fill='x', padx=10, pady=10)
+        
+        tk.Button(button_frame, text="🔥 Generate Correlation Matrix", command=self.generate_correlation,
+                 bg='#e74c3c', fg='white', font=('Arial', 11, 'bold'), height=1, width=25).pack(side='left', padx=5)
+        
+        tk.Button(button_frame, text="🧠 AI Feature Suggestions", command=self.generate_ai_suggestions,
+                 bg='#9b59b6', fg='white', font=('Arial', 11, 'bold'), height=1, width=20).pack(side='left', padx=5)
+        
+        # Results frame
+        results_frame = ttk.LabelFrame(parent, text="📊 Correlation Results")
+        results_frame.pack(fill='both', expand=True, padx=10, pady=10)
+        
+        # Split into correlation display and AI suggestions
+        analysis_frame = tk.Frame(results_frame)
+        analysis_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        # Correlation matrix (left side)
+        corr_frame = ttk.LabelFrame(analysis_frame, text="Correlation Matrix")
+        corr_frame.pack(side='left', fill='both', expand=True, padx=5)
+        
+        self.correlation_text = scrolledtext.ScrolledText(corr_frame, height=12, width=50, font=('Consolas', 8))
+        self.correlation_text.pack(fill='both', expand=True, padx=5, pady=5)
+        
+        # AI suggestions (right side)
+        ai_frame = ttk.LabelFrame(analysis_frame, text="🧠 AI Feature Insights")
+        ai_frame.pack(side='right', fill='both', expand=True, padx=5)
+        
+        self.ai_suggestions_text = scrolledtext.ScrolledText(ai_frame, height=12, width=40, font=('Consolas', 8))
+        self.ai_suggestions_text.pack(fill='both', expand=True, padx=5, pady=5)
     
     def populate_data_table(self, tree, data, info_label, max_rows=500):
         """Populate a treeview with data from a DataFrame."""
@@ -1841,7 +2331,7 @@ def main():
     
     else:
         # No command line arguments - run GUI
-        print("🚀 Starting Feature Matrix Editor v4.0 GUI...")
+        print("🚀 Starting Feature Matrix Editor v5.0 GUI...")
         create_gui()
         return 0
 
