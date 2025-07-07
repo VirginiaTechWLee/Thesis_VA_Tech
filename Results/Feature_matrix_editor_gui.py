@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Feature Matrix Editor v5
+Feature Matrix Editor v6
 ========================
 
 Complete tool for editing and enhancing HEEDS feature matrices with parameter data.
@@ -15,10 +15,10 @@ Features:
 - Comprehensive validation and logging
 
 Usage:
-    python feature_matrix_editor_gui_v5.py --help
+    python feature_matrix_editor_gui_v6.py --help
 
 Author: Enhanced Bolt Detection System
-Version: 5.0
+Version: 6.0
 """
 
 import pandas as pd
@@ -840,7 +840,7 @@ class FeatureMatrixEditorGUI:
     def __init__(self, root):
         """Initialize the GUI."""
         self.root = root
-        self.root.title("Feature Matrix Editor v5.0")
+        self.root.title("Feature Matrix Editor v6.0")
         self.root.geometry("1400x900")
         self.root.configure(bg='#f0f0f0')
         
@@ -873,13 +873,13 @@ class FeatureMatrixEditorGUI:
         self.combined_data = None
         self.loaded_full_matrix = None
         
-        self.log_message("🚀 Feature Matrix Editor v5.0 Ready!")
+        self.log_message("🚀 Feature Matrix Editor v6.0 Ready!")
         self.log_message("📋 Select your files and click 'Process Study' to begin")
     
     def create_widgets(self):
         """Create all GUI widgets."""
         # Title
-        title_label = tk.Label(self.root, text="Feature Matrix Editor v5.0", 
+        title_label = tk.Label(self.root, text="Feature Matrix Editor v6.0", 
                               font=('Arial', 20, 'bold'), bg='#f0f0f0', fg='#2c3e50')
         title_label.pack(pady=20)
         
@@ -919,7 +919,7 @@ class FeatureMatrixEditorGUI:
         button_frame.pack(fill='x', padx=5, pady=2)
         
         self.table_expanded = tk.BooleanVar(value=True)
-        self.expand_button = tk.Button(button_frame, text="▼ Hide Table", command=self.toggle_table,
+        self.expand_button = tk.Button(button_frame, text="▼ Hide Stiffness Table", command=self.toggle_table,
                                       font=('Arial', 8), bg='#ecf0f1', relief='flat')
         self.expand_button.pack(side='left')
         
@@ -927,18 +927,50 @@ class FeatureMatrixEditorGUI:
         self.table_container = tk.Frame(self.ref_frame)
         self.table_container.pack(fill='x', padx=5, pady=5)
         
-        # Create compact table with scrollable frame
-        canvas = tk.Canvas(self.table_container, height=120)
-        scrollbar = ttk.Scrollbar(self.table_container, orient="horizontal", command=canvas.xview)
+        # Create scrollable table with both horizontal and vertical scrollbars
+        table_frame = tk.Frame(self.table_container)
+        table_frame.pack(fill='both', expand=True)
+        
+        # Configure grid for proper scrollbar layout
+        table_frame.grid_rowconfigure(0, weight=1)
+        table_frame.grid_columnconfigure(0, weight=1)
+        
+        # Canvas for scrolling
+        canvas = tk.Canvas(table_frame, height=150, bg='white')
+        canvas.grid(row=0, column=0, sticky='nsew')
+        
+        # Scrollbars
+        v_scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=canvas.yview)
+        v_scrollbar.grid(row=0, column=1, sticky='ns')
+        
+        h_scrollbar = ttk.Scrollbar(table_frame, orient="horizontal", command=canvas.xview)
+        h_scrollbar.grid(row=1, column=0, sticky='ew')
+        
+        # Configure canvas scrolling
+        canvas.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
+        
+        # Scrollable frame inside canvas
         scrollable_frame = ttk.Frame(canvas)
+        canvas_frame = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
         
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
+        # Bind scrolling events
+        def configure_scroll_region(event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
         
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(xscrollcommand=scrollbar.set)
+        def configure_canvas_width(event):
+            canvas_width = canvas.winfo_width()
+            canvas.itemconfig(canvas_frame, width=canvas_width)
+        
+        scrollable_frame.bind("<Configure>", configure_scroll_region)
+        canvas.bind("<Configure>", configure_canvas_width)
+        
+        # Bind mousewheel to canvas for smooth scrolling
+        def on_mousewheel(event):
+            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        
+        canvas.bind("<MouseWheel>", on_mousewheel)  # Windows
+        canvas.bind("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))  # Linux
+        canvas.bind("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))   # Linux
         
         # Categories for display
         categories = ["Loose", "Very Loose", "Borderline", "Borderline", "Industry Std", 
@@ -967,20 +999,21 @@ class FeatureMatrixEditorGUI:
                 label.bind("<Enter>", lambda e, lbl=label: lbl.configure(bg='#e8e8e8'))
                 label.bind("<Leave>", lambda e, lbl=label: lbl.configure(bg='SystemButtonFace'))
         
-        canvas.pack(side="top", fill="x", expand=True, padx=5, pady=5)
-        scrollbar.pack(side="bottom", fill="x", padx=5)
+        # Update scroll region after all widgets are added
+        scrollable_frame.update_idletasks()
+        canvas.configure(scrollregion=canvas.bbox("all"))
     
     def toggle_table(self):
         """Toggle visibility of stiffness reference table."""
         if self.table_expanded.get():
             # Collapse table
             self.table_container.pack_forget()
-            self.expand_button.config(text="▶ Show Table")
+            self.expand_button.config(text="▶ Show Stiffness Table")
             self.table_expanded.set(False)
         else:
             # Expand table
             self.table_container.pack(fill='x', padx=5, pady=5)
-            self.expand_button.config(text="▼ Hide Table")
+            self.expand_button.config(text="▼ Hide Stiffness Table")
             self.table_expanded.set(True)
     
     def set_threshold_from_table(self, stiffness_value):
@@ -2331,7 +2364,7 @@ def main():
     
     else:
         # No command line arguments - run GUI
-        print("🚀 Starting Feature Matrix Editor v5.0 GUI...")
+        print("🚀 Starting Feature Matrix Editor v6.0 GUI...")
         create_gui()
         return 0
 
