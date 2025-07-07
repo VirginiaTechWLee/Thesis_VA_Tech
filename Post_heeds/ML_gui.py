@@ -1,2740 +1,1865 @@
-#!/usr/bin/env python3
-"""
-Feature Matrix Editor v7
-========================
-
-Complete tool for editing and enhancing HEEDS feature matrices with parameter data.
-Handles failed case detection, individual study processing, and multi-study combination.
-
-Features:
-- Automatic POST_0 folder scanning for failed case detection
-- Individual study processing with full traceability
-- Multi-study combination with global ML IDs
-- User-configurable CBUSH loose detection thresholds
-- Interactive stiffness reference table
-- Comprehensive validation and logging
-
-Usage:
-    python feature_matrix_editor_gui_v6.py --help
-
-Author: Enhanced Bolt Detection System
-Version: 7.0
-"""
-
-import pandas as pd
-import numpy as np
-import os
-import json
-import argparse
-import sys
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
-from pathlib import Path
-from datetime import datetime
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import seaborn as sns
 import threading
+import os
+from pathlib import Path
+import time
 import warnings
+import gc
+import psutil
+from collections import defaultdict
 warnings.filterwarnings('ignore')
 
+# Import the updated modules (these should be in the same directory)
+try:
+    from feature_matrix_builder import BoltAnomalyFeatureExtractor
+    FEATURE_EXTRACTOR_AVAILABLE = True
+except ImportError:
+    print("⚠️  feature_matrix_builder not found - some features will be disabled")
+    FEATURE_EXTRACTOR_AVAILABLE = False
 
-class FeatureMatrixEditor:
-    """
-    Complete editor for HEEDS feature matrices with parameter integration and traceability.
-    """
-    
-    def __init__(self, output_dir="edited_output", verbose=True):
-        """Initialize the feature matrix editor."""
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(exist_ok=True)
-        self.verbose = verbose
-        
-        # Tracking
-        self.processing_log = []
-        self.failed_operations = []
-        self.processed_studies = {}
-        
-        # Define parameter columns (pre-HEEDS inputs)
-        self.parameter_columns = [
-            'K4_1', 'K5_1', 'K6_1', 'K4_2', 'K5_2', 'K6_2', 'K4_3', 'K5_3', 'K6_3',
-            'K4_4', 'K5_4', 'K6_4', 'K4_5', 'K5_5', 'K6_5', 'K4_6', 'K5_6', 'K6_6',
-            'K4_7', 'K5_7', 'K6_7', 'K4_8', 'K5_8', 'K6_8', 'K4_9', 'K5_9', 'K6_9',
-            'K4_10', 'K5_10', 'K6_10'
-        ]
-        
-        # HEEDS parameter to stiffness mapping
-        self.stiffness_mapping = {
-            1: 1e4,   # loose
-            2: 1e5,   # very loose threshold
-            3: 1e6,   # borderline
-            4: 1e7,   # borderline 
-            5: 1e8,   # standard (industry baseline)
-            6: 1e9,   # tight
-            7: 1e10,  # tight
-            8: 1e11,  # tight
-            9: 1e12,  # very tight
-            10: 1e13, # approaching validation limit
-            11: 1e14, # validated healthy (beam study confirmed)
-        }
-        
-        self.log("🚀 Feature Matrix Editor Initialized")
-        self.log(f"📁 Output directory: {self.output_dir}")
-    
-    def log(self, message):
-        """Log message with timestamp."""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        log_entry = f"[{timestamp}] {message}"
-        self.processing_log.append(log_entry)
-        if self.verbose:
-            print(log_entry)
-    
-    def scan_post0_folder(self, heeds_directory):
-        """
-        Scan POST_0 folder to identify successful HEEDS designs.
-        
-        Args:
-            heeds_directory: Path to HEEDS output directory containing POST_0
-            
-        Returns:
-            dict: Scan results with successful and failed designs
-        """
-        try:
-            self.log("🔍 Scanning POST_0 folder for successful designs...")
-            
-            heeds_path = Path(heeds_directory)
-            post0_path = heeds_path / "POST_0"
-            
-            if not post0_path.exists():
-                raise ValueError(f"POST_0 folder not found in {heeds_directory}")
-            
-            successful_designs = []
-            failed_designs = []
-            
-            # Scan for Design_XXXX folders
-            for item in post0_path.iterdir():
-                if item.is_dir() and item.name.startswith("Design"):
-                    try:
-                        # Extract design number
-                        design_num = int(item.name.replace("Design", ""))
-                        
-                        # Check if Analysis_1 folder exists with required files
-                        analysis_path = item / "Analysis_1"
-                        if analysis_path.exists():
-                            accel_file = analysis_path / "acceleration_results.csv"
-                            disp_file = analysis_path / "displacement_results.csv"
-                            
-                            if accel_file.exists() and disp_file.exists():
-                                successful_designs.append(design_num)
-                            else:
-                                failed_designs.append(design_num)
-                        else:
-                            failed_designs.append(design_num)
-                            
-                    except ValueError:
-                        # Skip non-numeric Design folders
-                        continue
-            
-            # Sort for consistent ordering
-            successful_designs.sort()
-            failed_designs.sort()
-            
-            scan_results = {
-                'successful_designs': successful_designs,
-                'failed_designs': failed_designs,
-                'total_scanned': len(successful_designs) + len(failed_designs),
-                'success_rate': len(successful_designs) / (len(successful_designs) + len(failed_designs)) if (len(successful_designs) + len(failed_designs)) > 0 else 0
-            }
-            
-            self.log(f"   ✅ Successful designs: {len(successful_designs):,}")
-            self.log(f"   ❌ Failed designs: {len(failed_designs):,}")
-            self.log(f"   📊 Success rate: {scan_results['success_rate']:.1%}")
-            
-            if failed_designs:
-                # Log first 20 failed designs for debugging
-                failed_sample = failed_designs[:20]
-                if len(failed_designs) > 20:
-                    self.log(f"   🚫 Omitted designs: {failed_sample} (showing first 20 of {len(failed_designs)})")
-                else:
-                    self.log(f"   🚫 Omitted designs: {failed_designs}")
-            
-            return scan_results
-            
-        except Exception as e:
-            error_msg = f"❌ POST_0 scan failed: {str(e)}"
-            self.log(error_msg)
-            self.failed_operations.append(error_msg)
-            return None
-    
-    def load_parameter_file(self, param_file, study_name=None):
-        """
-        Load HEEDS parameter file and identify structure.
-        
-        Args:
-            param_file: Path to parameter CSV file
-            study_name: Optional study name override
-            
-        Returns:
-            dict: Parameter file information
-        """
-        try:
-            param_file = Path(param_file)
-            self.log(f"📋 Loading parameter file: {param_file.name}")
-            
-            # Auto-detect delimiter
-            with open(param_file, 'r') as f:
-                first_line = f.readline()
-                delimiter = '\t' if '\t' in first_line else ','
-            
-            # Load parameter file
-            param_df = pd.read_csv(param_file, delimiter=delimiter)
-            
-            # Create design_id mapping (row number = design number)
-            param_df['heeds_design_id'] = range(1, len(param_df) + 1)
-            
-            # Identify available parameter columns
-            available_params = [col for col in self.parameter_columns if col in param_df.columns]
-            missing_params = [col for col in self.parameter_columns if col not in param_df.columns]
-            
-            param_info = {
-                'file': param_file,
-                'study_name': study_name or param_file.stem,
-                'data': param_df,
-                'total_designs': len(param_df),
-                'available_parameters': available_params,
-                'missing_parameters': missing_params,
-                'delimiter': delimiter
-            }
-            
-            self.log(f"   ✅ Loaded {len(param_df):,} parameter sets")
-            self.log(f"   📊 Available parameters: {len(available_params)}/{len(self.parameter_columns)}")
-            
-            if missing_params:
-                self.log(f"   ⚠️  Missing parameters: {missing_params}")
-            
-            return param_info
-            
-        except Exception as e:
-            error_msg = f"❌ Failed to load parameter file {param_file}: {str(e)}"
-            self.log(error_msg)
-            self.failed_operations.append(error_msg)
-            return None
-    
-    def load_feature_matrix(self, matrix_file):
-        """
-        Load extracted feature matrix (post-HEEDS data).
-        
-        Args:
-            matrix_file: Path to feature matrix CSV
-            
-        Returns:
-            dict: Feature matrix information
-        """
-        try:
-            matrix_file = Path(matrix_file)
-            self.log(f"📈 Loading feature matrix: {matrix_file.name}")
-            
-            # Load feature matrix
-            feature_df = pd.read_csv(matrix_file)
-            
-            # Identify column types
-            feature_cols = [col for col in feature_df.columns 
-                           if col.startswith(('ACCE_', 'DISP_'))]
-            cbush_cols = [col for col in feature_df.columns 
-                         if col.startswith('cbush_') and col.endswith('_loose')]
-            meta_cols = [col for col in feature_df.columns 
-                        if col in ['design_id', 'study_name', 'study_type', 'extraction_method', 'study_description']]
-            
-            # Get design IDs
-            if 'design_id' in feature_df.columns:
-                design_ids = sorted(feature_df['design_id'].unique())
-            else:
-                raise ValueError("Feature matrix missing 'design_id' column")
-            
-            matrix_info = {
-                'file': matrix_file,
-                'data': feature_df,
-                'total_designs': len(feature_df),
-                'feature_columns': feature_cols,
-                'cbush_columns': cbush_cols,
-                'meta_columns': meta_cols,
-                'design_ids': design_ids,
-                'design_range': (min(design_ids), max(design_ids))
-            }
-            
-            self.log(f"   ✅ Loaded {len(feature_df):,} feature vectors")
-            self.log(f"   📊 Feature columns: {len(feature_cols)}")
-            self.log(f"   🔧 CBUSH columns: {len(cbush_cols)}")
-            self.log(f"   📏 Design range: {matrix_info['design_range'][0]}-{matrix_info['design_range'][1]}")
-            
-            return matrix_info
-            
-        except Exception as e:
-            error_msg = f"❌ Failed to load feature matrix {matrix_file}: {str(e)}"
-            self.log(error_msg)
-            self.failed_operations.append(error_msg)
-            return None
-    
-    def filter_to_successful_designs(self, param_info, matrix_info, scan_results):
-        """
-        Filter both parameter and feature data to only successful designs.
-        
-        Args:
-            param_info: Parameter file information
-            matrix_info: Feature matrix information  
-            scan_results: POST_0 scan results
-            
-        Returns:
-            tuple: (filtered_param_df, filtered_feature_df, alignment_stats)
-        """
-        try:
-            self.log("🔄 Filtering to successful designs only...")
-            
-            successful_designs = set(scan_results['successful_designs'])
-            param_designs = set(param_info['data']['heeds_design_id'].values)
-            feature_designs = set(matrix_info['design_ids'])
-            
-            # Find intersection of all three
-            valid_designs = successful_designs & param_designs & feature_designs
-            
-            # Calculate alignment statistics
-            alignment_stats = {
-                'post0_successful': len(successful_designs),
-                'param_available': len(param_designs),
-                'feature_available': len(feature_designs),
-                'final_valid': len(valid_designs),
-                'post0_failed': len(scan_results['failed_designs']),
-                'param_missing': len(param_designs - successful_designs),
-                'feature_missing': len(feature_designs - successful_designs),
-                'alignment_rate': len(valid_designs) / len(param_designs) if len(param_designs) > 0 else 0
-            }
-            
-            # Filter parameter data
-            param_df = param_info['data'].copy()
-            filtered_param_df = param_df[param_df['heeds_design_id'].isin(valid_designs)].copy()
-            
-            # Filter feature data  
-            feature_df = matrix_info['data'].copy()
-            filtered_feature_df = feature_df[feature_df['design_id'].isin(valid_designs)].copy()
-            
-            # Sort both by design_id for consistent ordering
-            filtered_param_df = filtered_param_df.sort_values('heeds_design_id').reset_index(drop=True)
-            filtered_feature_df = filtered_feature_df.sort_values('design_id').reset_index(drop=True)
-            
-            self.log(f"   📊 POST_0 successful: {alignment_stats['post0_successful']:,}")
-            self.log(f"   📊 Parameter available: {alignment_stats['param_available']:,}")
-            self.log(f"   📊 Feature available: {alignment_stats['feature_available']:,}")
-            self.log(f"   ✅ Final valid designs: {alignment_stats['final_valid']:,}")
-            self.log(f"   📈 Alignment rate: {alignment_stats['alignment_rate']:.1%}")
-            
-            # Log detailed omission analysis
-            self.log("🔍 Detailed alignment analysis:")
-            
-            # Designs missing from POST_0 success
-            param_but_not_post0 = param_designs - successful_designs
-            if param_but_not_post0:
-                sample_param_missing = sorted(list(param_but_not_post0))[:10]
-                if len(param_but_not_post0) > 10:
-                    self.log(f"   ❌ POST_0 failed: {sample_param_missing} (showing first 10 of {len(param_but_not_post0)})")
-                else:
-                    self.log(f"   ❌ POST_0 failed: {sample_param_missing}")
-            
-            # Designs missing from feature matrix
-            param_but_not_feature = param_designs - feature_designs
-            if param_but_not_feature:
-                sample_feature_missing = sorted(list(param_but_not_feature))[:10]
-                if len(param_but_not_feature) > 10:
-                    self.log(f"   📈 Feature extraction failed: {sample_feature_missing} (showing first 10 of {len(param_but_not_feature)})")
-                else:
-                    self.log(f"   📈 Feature extraction failed: {sample_feature_missing}")
-            
-            # Overall omitted designs (parameter designs that didn't make it to final)
-            omitted_designs = param_designs - valid_designs
-            if omitted_designs:
-                sample_omitted = sorted(list(omitted_designs))[:20]
-                if len(omitted_designs) > 20:
-                    self.log(f"   🚫 Total omitted from final: {sample_omitted} (showing first 20 of {len(omitted_designs)})")
-                else:
-                    self.log(f"   🚫 Total omitted from final: {sorted(list(omitted_designs))}")
-            
-            if alignment_stats['alignment_rate'] < 0.8:
-                self.log(f"   ⚠️  LOW ALIGNMENT RATE: {alignment_stats['alignment_rate']:.1%}")
-                self.log(f"   💡 Consider checking: POST_0 simulation stability, feature extraction robustness")
-            
-            return filtered_param_df, filtered_feature_df, alignment_stats
-            
-        except Exception as e:
-            error_msg = f"❌ Failed to filter to successful designs: {str(e)}"
-            self.log(error_msg)
-            self.failed_operations.append(error_msg)
-            return None, None, None
-    
-    def merge_parameter_features(self, param_df, feature_df, study_name, user_threshold=1e8):
-        """
-        Merge filtered parameter and feature data with traceability.
-        
-        Args:
-            param_df: Filtered parameter dataframe
-            feature_df: Filtered feature dataframe
-            study_name: Study name for identification
-            user_threshold: User-defined threshold for loose detection
-            
-        Returns:
-            pd.DataFrame: Merged enhanced dataset
-        """
-        try:
-            self.log("🔗 Merging parameter and feature data...")
-            
-            # Merge on design IDs
-            merged_df = pd.merge(
-                feature_df,
-                param_df,
-                left_on='design_id',
-                right_on='heeds_design_id',
-                how='inner'
-            )
-            
-            # Create ML ID (sequential within study)
-            merged_df['ml_id'] = range(1, len(merged_df) + 1)
-            
-            # Ensure study name consistency
-            merged_df['study_name'] = study_name
-            
-            # Reorder columns for clarity
-            id_columns = ['ml_id', 'heeds_design_id', 'study_name']
-            param_columns = [col for col in merged_df.columns if col in self.parameter_columns]
-            cbush_columns = [col for col in merged_df.columns if col.startswith('cbush_') and col.endswith('_loose')]
-            feature_columns = [col for col in merged_df.columns if col.startswith(('ACCE_', 'DISP_'))]
-            meta_columns = [col for col in merged_df.columns if col in ['study_type', 'study_description', 'extraction_method']]
-            
-            # Final column order
-            final_columns = (id_columns + param_columns + cbush_columns + 
-                           feature_columns + meta_columns)
-            
-            # Only include columns that exist
-            available_columns = [col for col in final_columns if col in merged_df.columns]
-            merged_df = merged_df[available_columns]
-            
-            # Apply parameter-based CBUSH loose detection (replace simulation-based)
-            merged_df = self.add_parameter_based_cbush_detection(merged_df, user_threshold)
-            
-            self.log(f"   ✅ Merged dataset: {len(merged_df):,} designs")
-            self.log(f"   📊 Total columns: {len(merged_df.columns)}")
-            self.log(f"   🔧 Parameters: {len(param_columns)}")
-            self.log(f"   📈 Features: {len(feature_columns)}")
-            self.log(f"   🎯 CBUSH labels: {len(cbush_columns)}")
-            
-            return merged_df
-            
-        except Exception as e:
-            error_msg = f"❌ Failed to merge parameter and feature data: {str(e)}"
-            self.log(error_msg)
-            self.failed_operations.append(error_msg)
-            return None
-    
-    def add_parameter_based_cbush_detection(self, df, user_threshold=1e8):
-        """
-        Add parameter-based CBUSH loose detection using user-defined threshold.
-        
-        IMPORTANT: This replaces the simulation-based cbush_X_loose columns which appear
-        to have incorrect results (high stiffness CBUSHes showing as loose).
-        
-        TODO: Update the main GUI feature extraction process to use this logic instead
-        of post-HEEDS simulation analysis. The simulation-based detection is showing
-        physically incorrect results.
-        
-        Args:
-            df: DataFrame with parameter columns (K4_X, K5_X, K6_X)
-            user_threshold: User-defined threshold for loose detection (default 1e8)
-            
-        Returns:
-            DataFrame with updated cbush_X_loose columns
-        """
-        try:
-            self.log(f"🔧 Applying parameter-based CBUSH loose detection (threshold < {user_threshold:.0e})...")
-            
-            # Normalize column names to handle case sensitivity
-            df_normalized = df.copy()
-            column_mapping = {}
-            for col in df.columns:
-                normalized_col = col.upper()
-                column_mapping[normalized_col] = col
-            
-            # Keep original simulation-based columns for comparison
-            simulation_cols = [col for col in df.columns if col.startswith('cbush_') and col.endswith('_loose')]
-            for col in simulation_cols:
-                if col in df.columns:
-                    df[f'{col}_simulation'] = df[col].copy()
-            
-            # Apply parameter-based logic
-            loose_count_by_cbush = {}
-            
-            # Helper function to safely convert to numeric
-            def safe_numeric_conversion(value, default=5):
-                """Convert value to integer, handle various data types."""
-                if pd.isna(value):
-                    return default
+try:
+    from multi_cbush_ml_pipeline import MultiCBUSHMLPipeline
+    ML_PIPELINE_AVAILABLE = True
+except ImportError:
+    print("⚠️  multi_cbush_ml_pipeline not found - ML features will be disabled")
+    ML_PIPELINE_AVAILABLE = False
+
+try:
+    from comprehensive_scoring_system import ComprehensiveMultiLabelScoring
+    SCORING_SYSTEM_AVAILABLE = True
+except ImportError:
+    print("⚠️  comprehensive_scoring_system not found - scoring features will be disabled")
+    SCORING_SYSTEM_AVAILABLE = False
+
+# ML Libraries
+try:
+    from sklearn.ensemble import RandomForestClassifier, VotingClassifier
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.model_selection import train_test_split, cross_val_score
+    from sklearn.multioutput import MultiOutputClassifier
+    from sklearn.metrics import (hamming_loss, jaccard_score, f1_score, 
+                                precision_score, recall_score, accuracy_score,
+                                classification_report)
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    print("⚠️  scikit-learn not available - ML features will be disabled")
+    SKLEARN_AVAILABLE = False
+
+try:
+    import xgboost as xgb
+    XGBOOST_AVAILABLE = True
+except ImportError:
+    print("⚠️  XGBoost not available - XGBoost will be disabled")
+    XGBOOST_AVAILABLE = False
+
+class FlexibleCBUSHProcessor:
+    """Enhanced processor for massive CBUSH bolt anomaly detection datasets."""
+   
+    def __init__(self):
+        """Initialize the flexible processor."""
+        self.heeds_directory = None
+        self.processed_data = {}
+        self.processing_stats = {}
+        self.is_paused = False
+        self.should_stop = False
+        self.current_operation = None
+        self.max_memory_gb = 16.0
+        self.batch_size = 500
+        self.chunk_processing = True
+        self.skip_failed_designs = True
+        self.log_failed_designs = True
+        self.max_failure_rate = 0.1
+       
+    def set_heeds_directory(self, directory_path):
+        """Set the main HEEDS output directory."""
+        self.heeds_directory = directory_path
+        print(f"✅ HEEDS directory set: {directory_path}")
+   
+    def validate_heeds_directory(self):
+        """Validate HEEDS directory structure."""
+        if not self.heeds_directory:
+            raise ValueError("HEEDS directory not set")
+       
+        if not os.path.exists(self.heeds_directory):
+            raise ValueError(f"HEEDS directory does not exist: {self.heeds_directory}")
+       
+        post_0_dir = os.path.join(self.heeds_directory, "POST_0")
+        if not os.path.exists(post_0_dir):
+            raise ValueError(f"POST_0 directory not found in {self.heeds_directory}")
+       
+        return True
+   
+    def scan_available_designs(self, post_0_directory=None):
+        """Scan POST_0 directory for available designs and detect patterns."""
+        if post_0_directory is None:
+            if not self.heeds_directory:
+                raise ValueError("No HEEDS directory set")
+            post_0_directory = os.path.join(self.heeds_directory, "POST_0")
+       
+        print(f"🔍 Scanning {post_0_directory} for available designs...")
+       
+        available_designs = {}
+        failed_designs = {}
+        design_dirs = []
+       
+        for item in os.listdir(post_0_directory):
+            if item.startswith("Design") and os.path.isdir(os.path.join(post_0_directory, item)):
                 try:
-                    # Handle string representations
-                    if isinstance(value, str):
-                        value = value.strip()
-                        if value == '':
-                            return default
-                    return int(float(value))
-                except (ValueError, TypeError):
-                    self.log(f"   ⚠️  Could not convert '{value}' to integer, using default {default}")
-                    return default
-            
-            # Helper function to get stiffness value
-            def get_stiffness_value(param_value, param_name=""):
-                """Get stiffness from parameter value with robust conversion."""
-                numeric_value = safe_numeric_conversion(param_value)
-                stiffness = self.stiffness_mapping.get(numeric_value, 1e8)
-                return stiffness, numeric_value
-            
-            self.log("🔍 Detailed CBUSH analysis:")
-            
-            for cbush_num in range(2, 11):  # CBUSHes 2-10 only (omit CBUSH 1)
-                # Try different case combinations for column names
-                possible_k4_names = [f'K4_{cbush_num}', f'k4_{cbush_num}', f'K4{cbush_num}', f'k4{cbush_num}']
-                possible_k5_names = [f'K5_{cbush_num}', f'k5_{cbush_num}', f'K5{cbush_num}', f'k5{cbush_num}']
-                possible_k6_names = [f'K6_{cbush_num}', f'k6_{cbush_num}', f'K6{cbush_num}', f'k6{cbush_num}']
-                
-                # Find actual column names
-                k4_col = None
-                k5_col = None  
-                k6_col = None
-                
-                for name in possible_k4_names:
-                    if name in df.columns:
-                        k4_col = name
-                        break
-                
-                for name in possible_k5_names:
-                    if name in df.columns:
-                        k5_col = name
-                        break
-                        
-                for name in possible_k6_names:
-                    if name in df.columns:
-                        k6_col = name
-                        break
-                
-                if all([k4_col, k5_col, k6_col]):
-                    # Process this CBUSH with robust logic
-                    loose_results = []
-                    
-                    # Debug first row for CBUSH 2
-                    if cbush_num == 2:
-                        sample_row = df.iloc[0]
-                        k4_raw = sample_row[k4_col]
-                        k5_raw = sample_row[k5_col]
-                        k6_raw = sample_row[k6_col]
-                        
-                        k4_stiffness, k4_numeric = get_stiffness_value(k4_raw, k4_col)
-                        k5_stiffness, k5_numeric = get_stiffness_value(k5_raw, k5_col)
-                        k6_stiffness, k6_numeric = get_stiffness_value(k6_raw, k6_col)
-                        
-                        self.log(f"   🔍 DEBUG CBUSH 2 (first row):")
-                        self.log(f"      {k4_col} raw: '{k4_raw}' → numeric: {k4_numeric} → stiffness: {k4_stiffness:.0e}")
-                        self.log(f"      {k5_col} raw: '{k5_raw}' → numeric: {k5_numeric} → stiffness: {k5_stiffness:.0e}")
-                        self.log(f"      {k6_col} raw: '{k6_raw}' → numeric: {k6_numeric} → stiffness: {k6_stiffness:.0e}")
-                        
-                        min_stiffness = min(k4_stiffness, k5_stiffness, k6_stiffness)
-                        is_loose = 1 if min_stiffness < user_threshold else 0
-                        
-                        self.log(f"      Min stiffness: {min_stiffness:.0e}")
-                        self.log(f"      Threshold: {user_threshold:.0e}")
-                        self.log(f"      Is loose: {is_loose} ({'LOOSE' if is_loose else 'TIGHT'})")
-                    
-                    # Apply to all rows
-                    for idx, row in df.iterrows():
-                        k4_stiffness, _ = get_stiffness_value(row[k4_col])
-                        k5_stiffness, _ = get_stiffness_value(row[k5_col])
-                        k6_stiffness, _ = get_stiffness_value(row[k6_col])
-                        
-                        min_stiffness = min(k4_stiffness, k5_stiffness, k6_stiffness)
-                        is_loose = 1 if min_stiffness < user_threshold else 0
-                        loose_results.append(is_loose)
-                    
-                    # Update dataframe
-                    df[f'cbush_{cbush_num}_loose'] = loose_results
-                    loose_count = sum(loose_results)
-                    loose_count_by_cbush[cbush_num] = loose_count
-                    
+                    design_num = int(item.replace("Design", ""))
+                    design_path = os.path.join(post_0_directory, item)
+                    design_dirs.append((design_num, design_path))
+                except ValueError:
+                    continue
+       
+        design_dirs.sort()
+       
+        print(f"📊 Found {len(design_dirs)} Design directories")
+       
+        for design_num, design_path in design_dirs:
+            analysis_dir = os.path.join(design_path, "Analysis_1")
+           
+            if os.path.exists(analysis_dir):
+                accel_file = os.path.join(analysis_dir, "acceleration_results.csv")
+                disp_file = os.path.join(analysis_dir, "displacement_results.csv")
+               
+                if os.path.exists(accel_file) and os.path.exists(disp_file):
+                    available_designs[design_num] = {
+                        'design_path': design_path,
+                        'analysis_path': analysis_dir,
+                        'accel_file': accel_file,
+                        'disp_file': disp_file,
+                        'file_size_mb': self._get_total_file_size([accel_file, disp_file])
+                    }
                 else:
-                    missing_cols = []
-                    if not k4_col: missing_cols.append(f'K4_{cbush_num}')
-                    if not k5_col: missing_cols.append(f'K5_{cbush_num}')
-                    if not k6_col: missing_cols.append(f'K6_{cbush_num}')
-                    
-                    self.log(f"   ⚠️  Missing parameter columns for CBUSH {cbush_num}: {missing_cols}")
-                    loose_count_by_cbush[cbush_num] = df.get(f'cbush_{cbush_num}_loose', pd.Series([0])).sum()
-            
-            # CBUSH 1 is omitted as requested (stays constant)
-            if 'cbush_1_loose' in df.columns:
-                loose_count_by_cbush[1] = df['cbush_1_loose'].sum()
-            
-            # Log the new distribution
-            self.log("   📊 Parameter-based CBUSH loose distribution:")
-            self.log(f"   🎯 Using threshold: {user_threshold:.0e} (below this = loose)")
-            total_designs = len(df)
-            for cbush_num in range(1, 11):
-                if cbush_num in loose_count_by_cbush:
-                    count = loose_count_by_cbush[cbush_num]
-                    percentage = (count / total_designs * 100) if total_designs > 0 else 0
-                    if cbush_num == 1:
-                        self.log(f"      CBUSH {cbush_num}: {count:,} loose ({percentage:.1f}%) - CONSTANT")
-                    else:
-                        self.log(f"      CBUSH {cbush_num}: {count:,} loose ({percentage:.1f}%)")
-            
-            self.log("   ✅ Parameter-based CBUSH detection complete")
-            
-            # Add documentation columns
-            df['cbush_detection_method'] = 'parameter_based_user_threshold'
-            df[f'loose_threshold'] = f'< {user_threshold:.0e}'
-            
-            return df
-            
-        except Exception as e:
-            error_msg = f"❌ Failed to apply parameter-based CBUSH detection: {str(e)}"
-            self.log(error_msg)
-            self.failed_operations.append(error_msg)
-            return df
-    
-    def process_single_study(self, param_file, matrix_file, heeds_directory, study_name=None, output_name=None, user_threshold=1e8):
-        """
-        Process a single study: parameter file + feature matrix + POST_0 validation.
-        
-        Args:
-            param_file: Path to parameter file
-            matrix_file: Path to feature matrix
-            heeds_directory: Path to HEEDS directory with POST_0
-            study_name: Optional study name
-            output_name: Optional output filename
-            user_threshold: User-defined threshold for loose detection
-            
-        Returns:
-            dict: Processing results
-        """
-        self.log(f"\n🔄 PROCESSING SINGLE STUDY")
-        self.log("=" * 50)
-        
-        try:
-            # Step 1: Scan POST_0 for successful designs
-            scan_results = self.scan_post0_folder(heeds_directory)
-            if not scan_results:
-                return None
-            
-            # Step 2: Load parameter file
-            param_info = self.load_parameter_file(param_file, study_name)
-            if not param_info:
-                return None
-            
-            # Step 3: Load feature matrix
-            matrix_info = self.load_feature_matrix(matrix_file)
-            if not matrix_info:
-                return None
-            
-            # Step 4: Filter to successful designs only
-            filtered_param_df, filtered_feature_df, alignment_stats = self.filter_to_successful_designs(
-                param_info, matrix_info, scan_results
-            )
-            if filtered_param_df is None:
-                return None
-            
-            # Step 5: Merge parameter and feature data
-            study_name = study_name or param_info['study_name']
-            merged_df = self.merge_parameter_features(filtered_param_df, filtered_feature_df, study_name, user_threshold)
-            if merged_df is None:
-                return None
-            
-            # Step 6: Save enhanced study
-            if output_name is None:
-                output_name = f"enhanced_{study_name.lower().replace(' ', '_')}.csv"
-            
-            output_path = self.output_dir / output_name
-            merged_df.to_csv(output_path, index=False)
-            
-            self.log(f"💾 Saved enhanced study: {output_path}")
-            
-            # Create processing summary
-            processing_summary = {
-                'study_name': study_name,
-                'param_file': str(param_file),
-                'matrix_file': str(matrix_file),
-                'heeds_directory': str(heeds_directory),
-                'output_file': str(output_path),
-                'scan_results': scan_results,
-                'alignment_stats': alignment_stats,
-                'final_dataset_shape': merged_df.shape,
-                'parameter_count': len([col for col in merged_df.columns if col in self.parameter_columns]),
-                'feature_count': len([col for col in merged_df.columns if col.startswith(('ACCE_', 'DISP_'))]),
-                'cbush_count': len([col for col in merged_df.columns if col.startswith('cbush_') and col.endswith('_loose')]),
-                'user_threshold': user_threshold,
-                'processing_timestamp': datetime.now().isoformat()
-            }
-            
-            # Store for later combination
-            self.processed_studies[study_name] = {
-                'data': merged_df,
-                'summary': processing_summary
-            }
-            
-            return processing_summary
-            
-        except Exception as e:
-            error_msg = f"❌ Single study processing failed: {str(e)}"
-            self.log(error_msg)
-            self.failed_operations.append(error_msg)
-            return None
-    
-    def combine_multiple_studies(self, study_files=None, output_name="final_enhanced_dataset.csv"):
-        """
-        Combine multiple processed studies into one dataset with global ML IDs.
-        
-        Args:
-            study_files: List of enhanced study CSV files (if None, uses processed_studies)
-            output_name: Output filename
-            
-        Returns:
-            dict: Combination results
-        """
-        self.log(f"\n🔗 COMBINING MULTIPLE STUDIES")
-        self.log("=" * 50)
-        
-        try:
-            all_study_data = []
-            study_composition = {}
-            
-            # Load studies (either from memory or files)
-            if study_files:
-                self.log("📁 Loading studies from files...")
-                for study_file in study_files:
-                    study_df = pd.read_csv(study_file)
-                    study_name = study_df['study_name'].iloc[0] if 'study_name' in study_df.columns else Path(study_file).stem
-                    all_study_data.append(study_df)
-                    study_composition[study_name] = len(study_df)
-                    self.log(f"   📊 {study_name}: {len(study_df):,} designs")
+                    missing_files = []
+                    if not os.path.exists(accel_file):
+                        missing_files.append("acceleration_results.csv")
+                    if not os.path.exists(disp_file):
+                        missing_files.append("displacement_results.csv")
+                   
+                    failed_designs[design_num] = f"Missing files: {', '.join(missing_files)}"
             else:
-                self.log("💾 Using processed studies from memory...")
-                for study_name, study_info in self.processed_studies.items():
-                    study_df = study_info['data']
-                    all_study_data.append(study_df)
-                    study_composition[study_name] = len(study_df)
-                    self.log(f"   📊 {study_name}: {len(study_df):,} designs")
-            
-            if not all_study_data:
-                raise ValueError("No studies available for combination")
-            
-            # Combine all studies
-            self.log("🔗 Combining datasets...")
-            combined_df = pd.concat(all_study_data, ignore_index=True)
-            
-            # Create global ML IDs
-            combined_df['ml_id'] = range(1, len(combined_df) + 1)
-            
-            # Check for design ID conflicts and handle them
-            original_heeds_ids = combined_df['heeds_design_id'].tolist()
-            study_names = combined_df['study_name'].tolist()
-            
-            # Create unique identifier combinations
-            unique_combinations = set(zip(study_names, original_heeds_ids))
-            
-            combination_stats = {
-                'total_studies': len(study_composition),
-                'study_composition': study_composition,
-                'total_combined_designs': len(combined_df),
-                'unique_heeds_combinations': len(unique_combinations),
-                'has_heeds_id_conflicts': len(unique_combinations) < len(combined_df),
-                'global_ml_id_range': (1, len(combined_df))
-            }
-            
-            self.log(f"   ✅ Combined {len(all_study_data)} studies")
-            self.log(f"   📊 Total designs: {len(combined_df):,}")
-            self.log(f"   🔢 Global ML ID range: 1-{len(combined_df)}")
-            
-            # Log study composition
-            self.log("📈 Final dataset composition:")
-            for study, count in study_composition.items():
-                percentage = (count / len(combined_df)) * 100
-                self.log(f"   {study}: {count:,} designs ({percentage:.1f}%)")
-            
-            # Save combined dataset
-            output_path = self.output_dir / output_name
-            combined_df.to_csv(output_path, index=False)
-            
-            self.log(f"💾 Saved combined dataset: {output_path}")
-            
-            # Create combination summary
-            combination_summary = {
-                'output_file': str(output_path),
-                'combination_stats': combination_stats,
-                'final_dataset_shape': combined_df.shape,
-                'column_summary': {
-                    'total_columns': len(combined_df.columns),
-                    'parameter_columns': len([col for col in combined_df.columns if col in self.parameter_columns]),
-                    'feature_columns': len([col for col in combined_df.columns if col.startswith(('ACCE_', 'DISP_'))]),
-                    'cbush_columns': len([col for col in combined_df.columns if col.startswith('cbush_') and col.endswith('_loose')])
-                },
-                'processing_timestamp': datetime.now().isoformat()
-            }
-            
-            return combination_summary
-            
-        except Exception as e:
-            error_msg = f"❌ Study combination failed: {str(e)}"
-            self.log(error_msg)
-            self.failed_operations.append(error_msg)
-            return None
-    
-    def validate_enhanced_dataset(self, dataset_file):
-        """
-        Validate the final enhanced dataset for ML readiness.
-        
-        Args:
-            dataset_file: Path to enhanced dataset CSV
-            
-        Returns:
-            dict: Validation results
-        """
-        try:
-            self.log(f"\n🔍 VALIDATING ENHANCED DATASET")
-            self.log("=" * 40)
-            
-            # Load dataset
-            df = pd.read_csv(dataset_file)
-            
-            # Basic structure validation
-            required_columns = ['ml_id', 'heeds_design_id', 'study_name']
-            missing_required = [col for col in required_columns if col not in df.columns]
-            
-            # Count different column types
-            param_cols = [col for col in df.columns if col in self.parameter_columns]
-            feature_cols = [col for col in df.columns if col.startswith(('ACCE_', 'DISP_'))]
-            cbush_cols = [col for col in df.columns if col.startswith('cbush_') and col.endswith('_loose')]
-            
-            # Data quality checks
-            validation_results = {
-                'total_designs': len(df),
-                'total_columns': len(df.columns),
-                'missing_required_columns': missing_required,
-                'parameter_columns': len(param_cols),
-                'feature_columns': len(feature_cols),
-                'cbush_label_columns': len(cbush_cols),
-                'missing_values': df.isnull().sum().sum(),
-                'duplicate_ml_ids': df['ml_id'].duplicated().sum(),
-                'ml_id_sequential': list(df['ml_id']) == list(range(1, len(df) + 1)),
-                'study_composition': df['study_name'].value_counts().to_dict(),
-                'heeds_id_range_by_study': {},
-                'cbush_label_distribution': {},
-                'data_quality_score': 0
-            }
-            
-            # Analyze HEEDS ID ranges by study
-            for study in df['study_name'].unique():
-                study_data = df[df['study_name'] == study]
-                heeds_ids = study_data['heeds_design_id'].values
-                validation_results['heeds_id_range_by_study'][study] = {
-                    'min': int(heeds_ids.min()),
-                    'max': int(heeds_ids.max()),
-                    'count': len(heeds_ids),
-                    'has_gaps': len(set(heeds_ids)) != (heeds_ids.max() - heeds_ids.min() + 1)
-                }
-            
-            # Analyze CBUSH label distribution
-            for cbush_col in cbush_cols:
-                loose_count = df[cbush_col].sum()
-                validation_results['cbush_label_distribution'][cbush_col] = {
-                    'loose_count': int(loose_count),
-                    'tight_count': int(len(df) - loose_count),
-                    'loose_percentage': float(loose_count / len(df) * 100)
-                }
-            
-            # Calculate overall data quality score
-            structure_score = 1.0 if not missing_required else 0.5
-            completeness_score = 1.0 - (validation_results['missing_values'] / (len(df) * len(df.columns)))
-            consistency_score = 1.0 if validation_results['ml_id_sequential'] and validation_results['duplicate_ml_ids'] == 0 else 0.5
-            
-            validation_results['data_quality_score'] = (structure_score + completeness_score + consistency_score) / 3
-            
-            # Log validation results
-            self.log(f"📊 Dataset validation results:")
-            self.log(f"   Total designs: {validation_results['total_designs']:,}")
-            self.log(f"   Total columns: {validation_results['total_columns']}")
-            self.log(f"   Parameter columns: {validation_results['parameter_columns']}")
-            self.log(f"   Feature columns: {validation_results['feature_columns']}")
-            self.log(f"   CBUSH label columns: {validation_results['cbush_label_columns']}")
-            self.log(f"   Missing values: {validation_results['missing_values']:,}")
-            self.log(f"   Data quality score: {validation_results['data_quality_score']:.1%}")
-            
-            if validation_results['data_quality_score'] >= 0.95:
-                self.log("   ✅ EXCELLENT - Ready for ML training!")
-            elif validation_results['data_quality_score'] >= 0.85:
-                self.log("   👍 GOOD - Suitable for ML training")
-            else:
-                self.log("   ⚠️  Issues detected - Review before ML training")
-            
-            return validation_results
-            
-        except Exception as e:
-            error_msg = f"❌ Dataset validation failed: {str(e)}"
-            self.log(error_msg)
-            self.failed_operations.append(error_msg)
-            return None
-    
-    def generate_comprehensive_report(self):
-        """Generate comprehensive processing report."""
-        report_path = self.output_dir / "processing_report.txt"
-        
-        with open(report_path, 'w') as f:
-            f.write("FEATURE MATRIX EDITOR PROCESSING REPORT\n")
-            f.write("=" * 60 + "\n\n")
-            
-            f.write(f"Processing completed: {datetime.now()}\n")
-            f.write(f"Output directory: {self.output_dir}\n\n")
-            
-            if self.processed_studies:
-                f.write(f"PROCESSED STUDIES ({len(self.processed_studies)}):\n")
-                f.write("-" * 30 + "\n")
-                for study_name, study_info in self.processed_studies.items():
-                    summary = study_info['summary']
-                    f.write(f"Study: {study_name}\n")
-                    f.write(f"  Designs: {summary['final_dataset_shape'][0]:,}\n")
-                    f.write(f"  Columns: {summary['final_dataset_shape'][1]}\n")
-                    f.write(f"  Alignment: {summary['alignment_stats']['alignment_rate']:.1%}\n")
-                    f.write(f"  Threshold: {summary.get('user_threshold', 'N/A')}\n")
-                    f.write(f"  Output: {summary['output_file']}\n\n")
-            
-            f.write("PROCESSING LOG:\n")
-            f.write("-" * 20 + "\n")
-            for log_entry in self.processing_log:
-                f.write(log_entry + "\n")
-            
-            if self.failed_operations:
-                f.write(f"\nFAILED OPERATIONS ({len(self.failed_operations)}):\n")
-                f.write("-" * 30 + "\n")
-                for failure in self.failed_operations:
-                    f.write(failure + "\n")
-        
-        self.log(f"📋 Generated comprehensive report: {report_path}")
-        return report_path
-
-
-class FeatureMatrixEditorGUI:
-    """
-    Simple GUI interface for the Feature Matrix Editor.
-    """
-    
-    def __init__(self, root):
-        """Initialize the GUI."""
-        self.root = root
-        self.root.title("Feature Matrix Editor v7.0")
-        self.root.geometry("1400x900")
-        self.root.configure(bg='#f0f0f0')
-        
-        # Initialize backend
-        self.editor = None
-        self.processing_thread = None
-        
-        # Variables for GUI inputs
-        self.param_file_var = tk.StringVar()
-        self.matrix_file_var = tk.StringVar()
-        self.heeds_dir_var = tk.StringVar()
-        self.output_dir_var = tk.StringVar(value="edited_output")
-        self.study_name_var = tk.StringVar()
-        self.validate_var = tk.BooleanVar(value=True)
-        self.threshold_var = tk.StringVar(value="1e8")  # Default to industry standard
-        self.custom_threshold_var = tk.StringVar()
-        
-        # Combine studies variables
-        self.study1_file_var = tk.StringVar()
-        self.study2_file_var = tk.StringVar()
-        
-        # Stiffness mapping for reference table
-        self.stiffness_mapping = {
-            1: 1e4, 2: 1e5, 3: 1e6, 4: 1e7, 5: 1e8, 6: 1e9, 
-            7: 1e10, 8: 1e11, 9: 1e12, 10: 1e13, 11: 1e14
+                failed_designs[design_num] = "Missing Analysis_1 directory"
+       
+        total_designs = len(available_designs) + len(failed_designs)
+        success_rate = len(available_designs) / total_designs if total_designs > 0 else 0
+       
+        print(f"✅ Scan complete: {len(available_designs)} available, {len(failed_designs)} failed ({success_rate:.1%} success)")
+       
+        return {
+            'available_designs': available_designs,
+            'failed_designs': failed_designs,
+            'success_rate': success_rate,
+            'total_scanned': total_designs
         }
+   
+    def _get_total_file_size(self, file_paths):
+        """Get total size of files in MB."""
+        total_size = 0
+        for path in file_paths:
+            if os.path.exists(path):
+                total_size += os.path.getsize(path)
+        return total_size / (1024 * 1024)
+   
+    def auto_detect_study_type(self, available_designs, study_name_hint=None):
+        """Auto-detect study type based on available designs and patterns."""
+        design_numbers = sorted(available_designs.keys())
+        total_designs = len(design_numbers)
+       
+        if total_designs == 0:
+            return {'type': 'empty', 'description': 'No designs available'}
+       
+        min_design = min(design_numbers)
+        max_design = max(design_numbers)
+        design_range = max_design - min_design + 1
+       
+        study_info = {
+            'design_numbers': design_numbers,
+            'total_designs': total_designs,
+            'design_range': (min_design, max_design),
+            'density': total_designs / design_range if design_range > 0 else 0,
+            'name': f'Auto_Study_{min_design}_{max_design}'
+        }
+       
+        # Study type classification
+        if total_designs == 64:
+            study_info.update({
+                'type': 'single_cbush_complete',
+                'description': 'Single-CBUSH Complete Study (64 designs)',
+                'likely_cbush_count': 1,
+                'expected_format': 'S1-Complete'
+            })
+        elif total_designs == 16:
+            study_info.update({
+                'type': 'adjacent_pairs',
+                'description': 'Adjacent Pairs Study (16 designs)',
+                'likely_cbush_count': 2,
+                'expected_format': 'S2-Limited'
+            })
+        elif total_designs in [576, 11979]:
+            study_info.update({
+                'type': 'single_cbush_batch',
+                'description': f'Single-CBUSH Batch Study ({total_designs} designs)',
+                'likely_cbush_count': 1,
+                'expected_format': 'S1-Complete' if total_designs > 1000 else 'S1-Limited'
+            })
+        elif total_designs in [128, 968]:
+            study_info.update({
+                'type': 'adjacent_pairs_batch',
+                'description': f'Adjacent Pairs Batch Study ({total_designs} designs)',
+                'likely_cbush_count': 2,
+                'expected_format': 'S2-Complete' if total_designs > 500 else 'S2-Limited'
+            })
+        elif total_designs in [192, 111804]:
+            study_info.update({
+                'type': 'multi_bolt_batch',
+                'description': f'Multi-Bolt Batch Study ({total_designs} designs)',
+                'likely_cbush_count': 3,
+                'expected_format': 'S3-Complete' if total_designs > 10000 else 'S3-Limited'
+            })
+        elif 1000 <= total_designs <= 20000:
+            study_info.update({
+                'type': 'random_study',
+                'description': f'Random Study ({total_designs} designs)',
+                'likely_cbush_count': 'variable',
+                'expected_format': 'Random'
+            })
+        elif total_designs > 20000:
+            study_info.update({
+                'type': 'massive_study',
+                'description': f'Massive Study ({total_designs} designs)',
+                'likely_cbush_count': 'variable',
+                'expected_format': 'S3-Complete or Large Random'
+            })
+        else:
+            study_info.update({
+                'type': 'custom_study',
+                'description': f'Custom Study ({total_designs} designs)',
+                'likely_cbush_count': 'unknown',
+                'expected_format': 'Custom'
+            })
+       
+        return study_info
+   
+    def process_study_batch(self, study_info, progress_callback=None):
+        """Process a study batch with the detected designs."""
+        if not FEATURE_EXTRACTOR_AVAILABLE:
+            raise ImportError("Feature extractor not available - cannot process studies")
+       
+        design_numbers = study_info.get('design_numbers', [])
+        if not design_numbers:
+            print("❌ No design numbers available for processing")
+            return None
+       
+        print(f"\n🔄 Processing study: {study_info.get('description', 'Unknown Study')}")
+        print(f"   Designs to process: {len(design_numbers):,}")
+       
+        extractor = BoltAnomalyFeatureExtractor(self.heeds_directory)
+       
+        all_features = []
+        batch_size = min(self.batch_size, len(design_numbers))
+       
+        for i in range(0, len(design_numbers), batch_size):
+            batch_end = min(i + batch_size, len(design_numbers))
+            batch_designs = design_numbers[i:batch_end]
+           
+            if progress_callback:
+                progress_callback(i, len(design_numbers), f"Processing batch {i//batch_size + 1}")
+           
+            print(f"   Processing batch {i//batch_size + 1}: designs {batch_designs[0]}-{batch_designs[-1]}")
+           
+            batch_features = extractor.process_design_batch_enhanced(
+                batch_designs, study_info, progress_callback
+            )
+           
+            if batch_features:
+                all_features.extend(batch_features)
+       
+        if all_features:
+            study_df = pd.DataFrame(all_features)
+            study_name = study_info.get('name', f"Study_{len(self.processed_data) + 1}")
+            self.store_processed_study(study_name, all_features)
+           
+            print(f"✅ Study processing complete: {len(study_df):,} designs processed")
+            return study_df
+        else:
+            print("❌ No features extracted from study")
+            return None
+   
+    def store_processed_study(self, study_name, study_data):
+        """Store processed study data with memory management."""
+        if study_data:
+            if isinstance(study_data, list):
+                study_df = pd.DataFrame(study_data)
+            else:
+                study_df = study_data
+           
+            self.processed_data[study_name] = {
+                'data': study_df,
+                'design_count': len(study_df),
+                'feature_count': len([col for col in study_df.columns if col.startswith(('ACCE_', 'DISP_'))]),
+                'memory_mb': study_df.memory_usage(deep=True).sum() / 1024 / 1024,
+                'processing_time': time.time(),
+                'quality_score': self._calculate_quality_score(study_df)
+            }
+           
+            print(f"💾 Stored study {study_name}: {len(study_df)} designs, {self.processed_data[study_name]['memory_mb']:.1f} MB")
+            self._manage_memory()
+   
+    def _calculate_quality_score(self, study_df):
+        """Calculate a quality score for the processed study."""
+        try:
+            missing_ratio = study_df.isnull().sum().sum() / (study_df.shape[0] * study_df.shape[1])
+            feature_cols = [col for col in study_df.columns if col.startswith(('ACCE_', 'DISP_'))]
+            if feature_cols:
+                feature_variance = study_df[feature_cols].var().mean()
+                variance_score = min(1.0, feature_variance / 1000)
+            else:
+                variance_score = 0.0
+           
+            cbush_cols = [col for col in study_df.columns if col.startswith('cbush_') and col.endswith('_loose')]
+            if cbush_cols:
+                label_consistency = 1 - (study_df[cbush_cols].sum(axis=1) == 0).mean()
+            else:
+                label_consistency = 0.0
+           
+            quality_score = (1 - missing_ratio) * 0.4 + variance_score * 0.3 + label_consistency * 0.3
+            return min(1.0, max(0.0, quality_score))
+           
+        except Exception:
+            return 0.5
+   
+    def _manage_memory(self):
+        """Manage memory usage by cleaning up data if necessary."""
+        try:
+            process = psutil.Process()
+            memory_mb = process.memory_info().rss / 1024 / 1024
+           
+            if memory_mb > self.max_memory_gb * 1024:
+                print(f"⚠️  High memory usage ({memory_mb:.0f} MB), cleaning up...")
+                gc.collect()
+                memory_mb_after = process.memory_info().rss / 1024 / 1024
+                print(f"   Memory after cleanup: {memory_mb_after:.0f} MB")
+               
+        except Exception:
+            pass
+   
+    def create_master_matrix(self, strategy="smart_combined", max_designs=50000):
+        """Create master matrix from processed studies."""
+        if not self.processed_data:
+            print("❌ No processed data available")
+            return None
+       
+        all_dataframes = []
+       
+        for study_name, study_info in self.processed_data.items():
+            all_dataframes.append(study_info['data'])
+            print(f"   Including {study_name}: {len(study_info['data']):,} designs")
+       
+        if all_dataframes:
+            master_df = pd.concat(all_dataframes, ignore_index=True)
+            print(f"✅ Master matrix created: {len(master_df):,} designs")
+            return master_df
+        else:
+            return None
+
+
+class EnhancedMLPipeline:
+    """Enhanced ML Pipeline with Random Forest, XGBoost, and Ensemble methods."""
+    
+    def __init__(self):
+        """Initialize the enhanced ML pipeline."""
+        self.scaler = StandardScaler()
+        self.models = {}
+        self.results = {}
+        self.feature_names = None
+        self.cbush_numbers = list(range(2, 11))
+        self.is_trained = False
+        
+    def prepare_data(self, master_df):
+        """Prepare data for ML training with proper scaling."""
+        print("🔧 PREPARING DATA FOR ML TRINITY")
+        
+        # Extract features and targets
+        feature_cols = [col for col in master_df.columns 
+                       if col.startswith(('ACCE_', 'DISP_'))]
+        cbush_cols = [f'cbush_{i}_loose' for i in self.cbush_numbers 
+                      if f'cbush_{i}_loose' in master_df.columns]
+        
+        self.feature_names = feature_cols
+        
+        print(f"   Features: {len(feature_cols)}")
+        print(f"   CBUSH targets: {len(cbush_cols)}")
+        
+        # Extract data
+        X = master_df[feature_cols].values
+        y = master_df[cbush_cols].values
+        
+        # Train/test split
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42
+        )
+        
+        # ⭐ CRITICAL: Feature scaling
+        print("⭐ Applying feature scaling (CRITICAL for performance)")
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        X_test_scaled = self.scaler.transform(X_test)
+        
+        # Check scaling effect
+        print(f"   Before scaling - Feature range: {X_train.min():.2e} to {X_train.max():.2e}")
+        print(f"   After scaling - Feature range: {X_train_scaled.min():.2f} to {X_train_scaled.max():.2f}")
+        
+        return X_train_scaled, X_test_scaled, y_train, y_test
+    
+    def train_ml_trinity(self, master_df):
+        """Train Random Forest, XGBoost, and Ensemble models."""
+        print("🚀 TRAINING ML TRINITY FOR SPACECRAFT BOLT DETECTION")
+        
+        # Prepare data
+        X_train, X_test, y_train, y_test = self.prepare_data(master_df)
+        
+        training_results = {}
+        
+        # 1. Random Forest (Baseline + Interpretability)
+        print("\n🌲 Training Random Forest...")
+        if SKLEARN_AVAILABLE:
+            rf_model = self._train_random_forest(X_train, X_test, y_train, y_test)
+            training_results['random_forest'] = rf_model
+        
+        # 2. XGBoost (Performance Champion)
+        print("\n🚀 Training XGBoost...")
+        if XGBOOST_AVAILABLE:
+            xgb_model = self._train_xgboost(X_train, X_test, y_train, y_test)
+            training_results['xgboost'] = xgb_model
+        
+        # 3. Ensemble (Best of Both Worlds)
+        print("\n🎯 Training Ensemble...")
+        if len(training_results) >= 2:
+            ensemble_model = self._train_ensemble(X_train, X_test, y_train, y_test, training_results)
+            training_results['ensemble'] = ensemble_model
+        
+        self.is_trained = True
+        return training_results
+    
+    def _train_random_forest(self, X_train, X_test, y_train, y_test):
+        """Train Random Forest with optimal parameters."""
+        start_time = time.time()
+        
+        # Optimized parameters for spacecraft application
+        rf = MultiOutputClassifier(
+            RandomForestClassifier(
+                n_estimators=200,
+                max_depth=15,
+                min_samples_split=10,
+                min_samples_leaf=5,
+                class_weight='balanced',
+                random_state=42,
+                n_jobs=4  # Safe for Windows
+            )
+        )
+        
+        rf.fit(X_train, y_train)
+        y_pred = rf.predict(X_test)
+        
+        training_time = time.time() - start_time
+        metrics = self._calculate_metrics(y_test, y_pred, 'Random Forest')
+        metrics['training_time'] = training_time
+        
+        self.models['random_forest'] = rf
+        self.results['random_forest'] = metrics
+        
+        print(f"   ✅ Random Forest trained in {training_time:.1f}s")
+        print(f"   📊 Exact Match: {metrics['exact_match_accuracy']:.1%}")
+        print(f"   📊 Jaccard Score: {metrics['jaccard_score']:.3f}")
+        
+        return rf
+    
+    def _train_xgboost(self, X_train, X_test, y_train, y_test):
+        """Train XGBoost with optimal parameters."""
+        start_time = time.time()
+        
+        # Optimized parameters for spacecraft application
+        xgb_model = MultiOutputClassifier(
+            xgb.XGBClassifier(
+                n_estimators=150,
+                max_depth=10,
+                learning_rate=0.1,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                random_state=42,
+                n_jobs=4,
+                eval_metric='logloss'
+            )
+        )
+        
+        xgb_model.fit(X_train, y_train)
+        y_pred = xgb_model.predict(X_test)
+        
+        training_time = time.time() - start_time
+        metrics = self._calculate_metrics(y_test, y_pred, 'XGBoost')
+        metrics['training_time'] = training_time
+        
+        self.models['xgboost'] = xgb_model
+        self.results['xgboost'] = metrics
+        
+        print(f"   ✅ XGBoost trained in {training_time:.1f}s")
+        print(f"   📊 Exact Match: {metrics['exact_match_accuracy']:.1%}")
+        print(f"   📊 Jaccard Score: {metrics['jaccard_score']:.3f}")
+        
+        return xgb_model
+    
+    def _train_ensemble(self, X_train, X_test, y_train, y_test, base_models):
+        """Train ensemble of base models."""
+        start_time = time.time()
+        
+        # Create ensemble from available models
+        estimators = []
+        if 'random_forest' in base_models:
+            estimators.append(('rf', base_models['random_forest']))
+        if 'xgboost' in base_models:
+            estimators.append(('xgb', base_models['xgboost']))
+        
+        if len(estimators) < 2:
+            print("   ❌ Need at least 2 models for ensemble")
+            return None
+        
+        # Create voting ensemble
+        ensemble = VotingClassifier(estimators, voting='hard')
+        ensemble.fit(X_train, y_train)
+        y_pred = ensemble.predict(X_test)
+        
+        training_time = time.time() - start_time
+        metrics = self._calculate_metrics(y_test, y_pred, 'Ensemble')
+        metrics['training_time'] = training_time
+        metrics['base_models'] = [name for name, _ in estimators]
+        
+        self.models['ensemble'] = ensemble
+        self.results['ensemble'] = metrics
+        
+        print(f"   ✅ Ensemble trained in {training_time:.1f}s")
+        print(f"   📊 Exact Match: {metrics['exact_match_accuracy']:.1%}")
+        print(f"   📊 Jaccard Score: {metrics['jaccard_score']:.3f}")
+        print(f"   🎯 Base models: {metrics['base_models']}")
+        
+        return ensemble
+    
+    def _calculate_metrics(self, y_true, y_pred, model_name):
+        """Calculate comprehensive metrics."""
+        n_samples, n_labels = y_true.shape
+        
+        # Exact Match Accuracy
+        exact_matches = np.all(y_true == y_pred, axis=1).sum()
+        exact_match_accuracy = exact_matches / n_samples
+        
+        # Hamming Loss
+        hamming = hamming_loss(y_true, y_pred)
+        
+        # Jaccard Score
+        jaccard = jaccard_score(y_true, y_pred, average='samples', zero_division=0)
+        
+        # F1 Scores
+        f1_macro = f1_score(y_true, y_pred, average='macro', zero_division=0)
+        f1_micro = f1_score(y_true, y_pred, average='micro', zero_division=0)
+        
+        # Precision and Recall
+        precision_macro = precision_score(y_true, y_pred, average='macro', zero_division=0)
+        recall_macro = recall_score(y_true, y_pred, average='macro', zero_division=0)
+        
+        # Deployment Score (Custom metric for spacecraft)
+        deployment_score = (
+            exact_match_accuracy * 0.4 + 
+            jaccard * 0.3 + 
+            (1 - hamming) * 0.3
+        ) * 100
+        
+        return {
+            'model_name': model_name,
+            'exact_match_accuracy': exact_match_accuracy,
+            'hamming_loss': hamming,
+            'jaccard_score': jaccard,
+            'f1_macro': f1_macro,
+            'f1_micro': f1_micro,
+            'precision_macro': precision_macro,
+            'recall_macro': recall_macro,
+            'deployment_score': deployment_score,
+            'n_samples': n_samples,
+            'n_labels': n_labels
+        }
+    
+    def get_model_comparison(self):
+        """Get comparison of all trained models."""
+        if not self.results:
+            return None
+        
+        comparison_data = []
+        for model_name, metrics in self.results.items():
+            comparison_data.append({
+                'Model': model_name.title(),
+                'Exact_Match': f"{metrics['exact_match_accuracy']:.1%}",
+                'Jaccard_Score': f"{metrics['jaccard_score']:.3f}",
+                'Hamming_Loss': f"{metrics['hamming_loss']:.3f}",
+                'F1_Macro': f"{metrics['f1_macro']:.3f}",
+                'Deployment_Score': f"{metrics['deployment_score']:.1f}/100",
+                'Training_Time': f"{metrics.get('training_time', 0):.1f}s"
+            })
+        
+        return pd.DataFrame(comparison_data)
+    
+    def predict_bolt_condition(self, X_new, model_name='ensemble'):
+        """Predict bolt condition using specified model."""
+        if model_name not in self.models:
+            model_name = list(self.models.keys())[0] if self.models else None
+            
+        if not model_name:
+            return None
+        
+        model = self.models[model_name]
+        X_scaled = self.scaler.transform(X_new.reshape(1, -1))
+        predictions = model.predict(X_scaled)[0]
+        
+        loose_cbushes = [self.cbush_numbers[i] for i, pred in enumerate(predictions) if pred == 1]
+        
+        return {
+            'model_used': model_name,
+            'loose_cbushes': loose_cbushes,
+            'prediction_vector': predictions.tolist(),
+            'confidence': 'High' if len(loose_cbushes) <= 2 else 'Medium'
+        }
+
+
+class MassiveDatasetBoltDetectionGUI:
+    """Enhanced GUI for massive dataset multi-CBUSH bolt anomaly detection with CSV upload."""
+   
+    def __init__(self, root):
+        """Initialize the enhanced GUI."""
+        self.root = root
+        self.root.title("Multi-CBUSH Bolt Detection System v4.0 - Enhanced ML Edition")
+        self.root.geometry("1600x1000")
+        self.root.configure(bg='#f0f0f0')
+       
+        # Initialize backend components
+        self.processor = FlexibleCBUSHProcessor()
+        self.ml_pipeline = EnhancedMLPipeline()
+        if SCORING_SYSTEM_AVAILABLE:
+            self.scoring_system = ComprehensiveMultiLabelScoring()
+        else:
+            self.scoring_system = None
+       
+        self.current_data = None
+        self.loaded_data = None  # For CSV uploads
+        self.scan_results = None
+        self.study_info = None
+       
+        # Threading
+        self.processing_thread = None
+        self.scanning_thread = None
+        self.training_thread = None
+       
+        # ⭐ NEW: Manual range variables
+        self.use_manual_range = None
+        self.manual_study_name = None
+        self.manual_start = None
+        self.manual_end = None
+        self.manual_controls_frame = None
         
         # Create GUI
         self.create_widgets()
-        
-        # Data storage for previews
-        self.param_data = None
-        self.matrix_data = None
-        self.combined_data = None
-        self.loaded_full_matrix = None
-        
-        self.log_message("🚀 Feature Matrix Editor v6.0 Ready!")
-        self.log_message("📋 Select your files and click 'Process Study' to begin")
-    
+       
+        # Initial status
+        self.log_message("🚀 Enhanced Bolt Detection System v4.0 Ready!")
+        self.log_message("📊 New Features: CSV Upload, ML Trinity (RF+XGBoost+Ensemble), Manual Range")
+        self.log_message("🎯 Target: 70-85% Deployment Score for Spacecraft Safety")
+   
     def create_widgets(self):
         """Create all GUI widgets."""
+        # Create notebook for tabs
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill='both', expand=True, padx=10, pady=10)
+       
+        # Create tabs
+        self.create_setup_tab()
+        self.create_scan_tab()
+        self.create_processing_tab()
+        self.create_matrix_tab()  # Enhanced with CSV upload
+        self.create_ml_tab()      # Enhanced with ML Trinity
+        if SCORING_SYSTEM_AVAILABLE:
+            self.create_scoring_tab()
+        self.create_results_tab()
+   
+    def create_setup_tab(self):
+        """Create enhanced setup tab."""
+        setup_frame = ttk.Frame(self.notebook)
+        self.notebook.add(setup_frame, text="🔧 Setup")
+       
         # Title
-        title_label = tk.Label(self.root, text="Feature Matrix Editor v6.0", 
+        title_label = tk.Label(setup_frame, text="Enhanced Bolt Detection System v4.0",
                               font=('Arial', 20, 'bold'), bg='#f0f0f0', fg='#2c3e50')
         title_label.pack(pady=20)
-        
-        subtitle_label = tk.Label(self.root, text="HEEDS Parameter-Feature Integration with Traceability",
-                                 font=('Arial', 12), bg='#f0f0f0', fg='#7f8c8d')
+       
+        subtitle_label = tk.Label(setup_frame, text="ML Trinity: Random Forest + XGBoost + Ensemble | CSV Upload | Manual Range",
+                                 font=('Arial', 14), bg='#f0f0f0', fg='#7f8c8d')
         subtitle_label.pack(pady=5)
+       
+        # HEEDS directory configuration
+        config_frame = ttk.LabelFrame(setup_frame, text="HEEDS Output Directory Configuration")
+        config_frame.pack(fill='x', padx=20, pady=20)
+       
+        # Directory input
+        dir_frame = tk.Frame(config_frame)
+        dir_frame.pack(fill='x', padx=10, pady=15)
+       
+        tk.Label(dir_frame, text="HEEDS Output Directory (containing POST_0 folder):",
+                font=('Arial', 12, 'bold')).pack(anchor='w')
+       
+        path_input_frame = tk.Frame(dir_frame)
+        path_input_frame.pack(fill='x', pady=10)
+       
+        self.heeds_path_var = tk.StringVar()
+        path_entry = tk.Entry(path_input_frame, textvariable=self.heeds_path_var,
+                             width=100, font=('Arial', 10))
+        path_entry.pack(side='left', fill='x', expand=True)
+       
+        tk.Button(path_input_frame, text="📁 Browse",
+                 command=self.browse_heeds_directory,
+                 bg='#3498db', fg='white', font=('Arial', 10, 'bold')).pack(side='right', padx=(10,0))
+       
+        # Directory validation
+        validate_frame = tk.Frame(config_frame)
+        validate_frame.pack(fill='x', padx=10, pady=10)
+       
+        tk.Button(validate_frame, text="✅ Validate Directory",
+                 command=self.validate_directory,
+                 bg='#27ae60', fg='white', font=('Arial', 12, 'bold'),
+                 height=2, width=20).pack(side='left')
+       
+        self.validation_status = tk.Label(validate_frame, text="No directory selected",
+                                         font=('Arial', 11), fg='#7f8c8d')
+        self.validation_status.pack(side='left', padx=20)
+       
+        # System status
+        self.status_frame = ttk.LabelFrame(setup_frame, text="System Status & Log")
+        self.status_frame.pack(fill='both', expand=True, padx=20, pady=20)
+       
+        self.status_text = scrolledtext.ScrolledText(self.status_frame, height=25, width=120,
+                                                    font=('Consolas', 9))
+        self.status_text.pack(fill='both', expand=True, padx=10, pady=10)
+   
+    def create_scan_tab(self):
+        """Create scan and detection tab with MANUAL RANGE feature."""
+        scan_frame = ttk.Frame(self.notebook)
+        self.notebook.add(scan_frame, text="🔍 Scan & Detect")
+       
+        # Scan controls
+        scan_control_frame = ttk.LabelFrame(scan_frame, text="Design Scanning & Auto-Detection")
+        scan_control_frame.pack(fill='x', padx=20, pady=15)
+       
+        tk.Label(scan_control_frame, text="Scan HEEDS directory for available designs and auto-detect study patterns:",
+                font=('Arial', 12)).pack(anchor='w', padx=10, pady=10)
+       
+        scan_button_frame = tk.Frame(scan_control_frame)
+        scan_button_frame.pack(fill='x', padx=10, pady=15)
+       
+        tk.Button(scan_button_frame, text="🔍 Scan Available Designs",
+                 command=self.scan_designs,
+                 bg='#3498db', fg='white', font=('Arial', 14, 'bold'),
+                 height=2, width=25).pack(side='left')
         
-        # Stiffness Reference Table
-        self.create_stiffness_reference_table()
+        # ⭐ NEW: Manual Range & Study Definition Section
+        manual_frame = ttk.LabelFrame(scan_control_frame, text="Manual Range & Study Definition")
+        manual_frame.pack(fill='x', padx=10, pady=10)
         
-        # Create main container with horizontal layout
-        main_container = tk.Frame(self.root)
-        main_container.pack(fill='both', expand=True, padx=10, pady=10)
+        # Checkbox to enable manual mode
+        self.use_manual_range = tk.BooleanVar(value=False)
+        tk.Checkbutton(manual_frame, text="☑️ Use Manual Range", 
+                       variable=self.use_manual_range,
+                       command=self.toggle_manual_range,
+                       font=('Arial', 11, 'bold')).pack(anchor='w', padx=10, pady=5)
         
-        # Left panel for controls
-        left_panel = tk.Frame(main_container)
-        left_panel.pack(side='left', fill='y', padx=(0, 10))
+        # Manual controls frame (will be enabled/disabled)
+        self.manual_controls_frame = tk.Frame(manual_frame)
+        self.manual_controls_frame.pack(fill='x', padx=10, pady=5)
         
-        # Right panel for data previews
-        right_panel = tk.Frame(main_container)
-        right_panel.pack(side='right', fill='both', expand=True)
+        # Study name input
+        study_name_frame = tk.Frame(self.manual_controls_frame)
+        study_name_frame.pack(fill='x', pady=2)
+        tk.Label(study_name_frame, text="Study Name:", font=('Arial', 10, 'bold')).pack(side='left')
+        self.manual_study_name = tk.StringVar(value="Custom_Study")
+        study_name_entry = tk.Entry(study_name_frame, textvariable=self.manual_study_name, width=50, font=('Arial', 10))
+        study_name_entry.pack(side='left', padx=10, fill='x', expand=True)
         
-        # Create control widgets in left panel
-        self.create_control_widgets(left_panel)
+        # Range inputs
+        range_frame = tk.Frame(self.manual_controls_frame)
+        range_frame.pack(fill='x', pady=2)
         
-        # Create data preview tabs in right panel
-        self.create_data_preview_tabs(right_panel)
-    
-    def create_stiffness_reference_table(self):
-        """Create collapsible stiffness reference table on main page."""
-        # Stiffness Reference Table (collapsible)
-        self.ref_frame = ttk.LabelFrame(self.root, text="📊 Stiffness Reference (Click to Set Threshold)")
-        self.ref_frame.pack(fill='x', padx=10, pady=5)
+        tk.Label(range_frame, text="Start:", font=('Arial', 10, 'bold')).pack(side='left')
+        self.manual_start = tk.StringVar(value="1")
+        start_entry = tk.Entry(range_frame, textvariable=self.manual_start, width=10, font=('Arial', 10))
+        start_entry.pack(side='left', padx=5)
         
-        # Collapse/Expand button
-        button_frame = tk.Frame(self.ref_frame)
-        button_frame.pack(fill='x', padx=5, pady=2)
+        tk.Label(range_frame, text="End:", font=('Arial', 10, 'bold')).pack(side='left', padx=(20,5))
+        self.manual_end = tk.StringVar(value="7000")
+        end_entry = tk.Entry(range_frame, textvariable=self.manual_end, width=10, font=('Arial', 10))
+        end_entry.pack(side='left', padx=5)
         
-        self.table_expanded = tk.BooleanVar(value=True)
-        self.expand_button = tk.Button(button_frame, text="▼ Hide Stiffness Table", command=self.toggle_table,
-                                      font=('Arial', 8), bg='#ecf0f1', relief='flat')
-        self.expand_button.pack(side='left')
+        # Validation button
+        tk.Button(range_frame, text="✓ Validate Range", 
+                 command=self.validate_manual_range,
+                 bg='#f39c12', fg='white', font=('Arial', 9, 'bold')).pack(side='left', padx=20)
         
-        # Table container (collapsible)
-        self.table_container = tk.Frame(self.ref_frame)
-        self.table_container.pack(fill='x', padx=5, pady=5)
+        # Information text
+        info_text = ("Manual range allows you to:\n"
+                    "• Override auto-detection with your own study name\n"
+                    "• Process specific design ranges (e.g. 1-7000)\n"
+                    "• Handle partial studies or custom configurations")
+        tk.Label(manual_frame, text=info_text, font=('Arial', 9), fg='#7f8c8d', justify='left').pack(anchor='w', padx=10, pady=5)
         
-        # Create scrollable table with both horizontal and vertical scrollbars
-        table_frame = tk.Frame(self.table_container)
-        table_frame.pack(fill='both', expand=True)
-        
-        # Configure grid for proper scrollbar layout
-        table_frame.grid_rowconfigure(0, weight=1)
-        table_frame.grid_columnconfigure(0, weight=1)
-        
-        # Canvas for scrolling
-        canvas = tk.Canvas(table_frame, height=150, bg='white')
-        canvas.grid(row=0, column=0, sticky='nsew')
-        
-        # Scrollbars
-        v_scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=canvas.yview)
-        v_scrollbar.grid(row=0, column=1, sticky='ns')
-        
-        h_scrollbar = ttk.Scrollbar(table_frame, orient="horizontal", command=canvas.xview)
-        h_scrollbar.grid(row=1, column=0, sticky='ew')
-        
-        # Configure canvas scrolling
-        canvas.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
-        
-        # Scrollable frame inside canvas
-        scrollable_frame = ttk.Frame(canvas)
-        canvas_frame = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        
-        # Bind scrolling events
-        def configure_scroll_region(event):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-        
-        def configure_canvas_width(event):
-            canvas_width = canvas.winfo_width()
-            canvas.itemconfig(canvas_frame, width=canvas_width)
-        
-        scrollable_frame.bind("<Configure>", configure_scroll_region)
-        canvas.bind("<Configure>", configure_canvas_width)
-        
-        # Bind mousewheel to canvas for smooth scrolling
-        def on_mousewheel(event):
-            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-        
-        canvas.bind("<MouseWheel>", on_mousewheel)  # Windows
-        canvas.bind("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))  # Linux
-        canvas.bind("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))   # Linux
-        
-        # Categories for display
-        categories = ["Loose", "Very Loose", "Borderline", "Borderline", "Industry Std", 
-                      "Tight", "Very Tight", "Extremely Tight", "Ultra Tight", "Near Limit", "Validated"]
-        
-        # Create table headers
-        tk.Label(scrollable_frame, text="ID", font=('Arial', 9, 'bold'), relief="solid", borderwidth=1, padx=5).grid(row=0, column=0, sticky='ew')
-        tk.Label(scrollable_frame, text="Stiffness (N·m/rad)", font=('Arial', 9, 'bold'), relief="solid", borderwidth=1, padx=5).grid(row=0, column=1, sticky='ew')
-        tk.Label(scrollable_frame, text="Category", font=('Arial', 9, 'bold'), relief="solid", borderwidth=1, padx=5).grid(row=0, column=2, sticky='ew')
-        
-        # Data rows - make clickable
-        for i, (id_num, stiffness) in enumerate(self.stiffness_mapping.items()):
-            # Create clickable row
-            id_label = tk.Label(scrollable_frame, text=str(id_num), relief="solid", borderwidth=1, padx=5, cursor="hand2")
-            stiff_label = tk.Label(scrollable_frame, text=f"{stiffness:.0e}", relief="solid", borderwidth=1, padx=5, cursor="hand2")
-            cat_label = tk.Label(scrollable_frame, text=categories[i], relief="solid", borderwidth=1, padx=5, cursor="hand2")
-            
-            id_label.grid(row=i+1, column=0, sticky='ew')
-            stiff_label.grid(row=i+1, column=1, sticky='ew')
-            cat_label.grid(row=i+1, column=2, sticky='ew')
-            
-            # Bind click events to set threshold
-            for label in [id_label, stiff_label, cat_label]:
-                label.bind("<Button-1>", lambda e, val=stiffness: self.set_threshold_from_table(val))
-                # Hover effect
-                label.bind("<Enter>", lambda e, lbl=label: lbl.configure(bg='#e8e8e8'))
-                label.bind("<Leave>", lambda e, lbl=label: lbl.configure(bg='SystemButtonFace'))
-        
-        # Update scroll region after all widgets are added
-        scrollable_frame.update_idletasks()
-        canvas.configure(scrollregion=canvas.bbox("all"))
-    
-    def toggle_table(self):
-        """Toggle visibility of stiffness reference table."""
-        if self.table_expanded.get():
-            # Collapse table
-            self.table_container.pack_forget()
-            self.expand_button.config(text="▶ Show Stiffness Table")
-            self.table_expanded.set(False)
-        else:
-            # Expand table
-            self.table_container.pack(fill='x', padx=5, pady=5)
-            self.expand_button.config(text="▼ Hide Stiffness Table")
-            self.table_expanded.set(True)
-    
-    def set_threshold_from_table(self, stiffness_value):
-        """Set threshold from clicking on reference table."""
-        self.threshold_var.set(f"{stiffness_value:.0e}")
-        self.log_message(f"🎯 Threshold set to {stiffness_value:.0e} from reference table")
-    
-    def on_threshold_change(self, event=None):
-        """Handle threshold dropdown selection change."""
-        if self.threshold_var.get() == "Custom":
-            self.custom_entry.pack(fill='x', pady=2)
-            self.custom_entry.focus()
-        else:
-            self.custom_entry.pack_forget()
-    
-    def validate_threshold(self, threshold_str):
-        """Validate threshold is valid scientific notation."""
-        try:
-            value = float(threshold_str)
-            if value <= 0:
-                raise ValueError("Threshold must be positive")
-            return value
-        except:
-            raise ValueError(f"Invalid threshold format: {threshold_str}")
-    
-    def get_user_threshold(self):
-        """Get threshold from GUI, with validation."""
-        try:
-            if self.threshold_var.get() == "Custom":
-                if not self.custom_threshold_var.get():
-                    raise ValueError("Custom threshold cannot be empty")
-                return self.validate_threshold(self.custom_threshold_var.get())
+        # Initially disable manual controls
+        self.toggle_manual_range()
+       
+        # Scan progress
+        self.scan_progress_frame = tk.Frame(scan_control_frame)
+        self.scan_progress_frame.pack(fill='x', padx=10, pady=10)
+       
+        self.scan_progress_var = tk.DoubleVar()
+        self.scan_progress_bar = ttk.Progressbar(self.scan_progress_frame, variable=self.scan_progress_var,
+                                               maximum=100, length=500, mode='indeterminate')
+        self.scan_progress_bar.pack(pady=5)
+       
+        self.scan_status_label = tk.Label(self.scan_progress_frame, text="Ready to scan",
+                                         font=('Arial', 10), fg='#7f8c8d')
+        self.scan_status_label.pack()
+       
+        # Scan results display
+        results_frame = ttk.LabelFrame(scan_frame, text="Scan Results & Study Detection")
+        results_frame.pack(fill='both', expand=True, padx=20, pady=15)
+       
+        # Results tree
+        columns = ('Property', 'Value', 'Description')
+        self.results_tree = ttk.Treeview(results_frame, columns=columns, show='headings', height=15)
+       
+        for col in columns:
+            self.results_tree.heading(col, text=col)
+            if col == 'Property':
+                self.results_tree.column(col, width=200)
+            elif col == 'Value':
+                self.results_tree.column(col, width=150)
             else:
-                return float(self.threshold_var.get())
-        except Exception as e:
-            # Default to industry standard if error
-            self.log_message(f"⚠️  Threshold error: {str(e)}, using default 1e8")
-            return 1e8
+                self.results_tree.column(col, width=400)
+       
+        # Add scrollbars
+        tree_frame = tk.Frame(results_frame)
+        tree_frame.pack(fill='both', expand=True, padx=10, pady=10)
+       
+        scrollbar_v = ttk.Scrollbar(tree_frame, orient='vertical', command=self.results_tree.yview)
+        scrollbar_h = ttk.Scrollbar(tree_frame, orient='horizontal', command=self.results_tree.xview)
+        self.results_tree.configure(yscrollcommand=scrollbar_v.set, xscrollcommand=scrollbar_h.set)
+       
+        self.results_tree.pack(side='left', fill='both', expand=True)
+        scrollbar_v.pack(side='right', fill='y')
+        scrollbar_h.pack(side='bottom', fill='x')
     
-    def update_scaling_description(self, event=None):
-        """Update scaling method description."""
-        method = self.scaling_method_var.get()
-        descriptions = {
-            "StandardScaler": "Mean=0, Std=1 (best for most ML algorithms)",
-            "MinMaxScaler": "Scale to 0-1 range (preserves relationships)", 
-            "RobustScaler": "Median-based, robust to outliers",
-            "MaxAbsScaler": "Scale by maximum absolute value",
-            "Normalizer": "Scale individual samples to unit norm"
-        }
-        self.method_desc_label.config(text=descriptions.get(method, "Unknown scaling method"))
-    
-    def apply_scaling(self):
-        """Apply scaling to selected features."""
-        if self.combined_data is None:
-            messagebox.showwarning("No Data", "Please process a study first to enable scaling")
-            return
+    def toggle_manual_range(self):
+        """Enable/disable manual range controls."""
+        state = 'normal' if self.use_manual_range.get() else 'disabled'
         
+        for widget in self.manual_controls_frame.winfo_children():
+            if isinstance(widget, tk.Frame):
+                for child in widget.winfo_children():
+                    if isinstance(child, (tk.Entry, tk.Button)):
+                        child.config(state=state)
+    
+    def validate_manual_range(self):
+        """Validate manual range inputs."""
         try:
-            # Import scaling modules
-            from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler, MaxAbsScaler, Normalizer
-            import numpy as np
+            start = int(self.manual_start.get())
+            end = int(self.manual_end.get())
             
-            # Get scaling method
-            method_name = self.scaling_method_var.get()
-            scalers = {
-                "StandardScaler": StandardScaler(),
-                "MinMaxScaler": MinMaxScaler(),
-                "RobustScaler": RobustScaler(),
-                "MaxAbsScaler": MaxAbsScaler(),
-                "Normalizer": Normalizer()
-            }
+            if start >= end:
+                messagebox.showerror("Invalid Range", "Start must be less than End")
+                return False
             
-            scaler = scalers[method_name]
+            if start < 1:
+                messagebox.showerror("Invalid Range", "Start must be at least 1")
+                return False
+                
+            # Check against available designs if scan has been run
+            if hasattr(self, 'scan_results') and self.scan_results:
+                available = list(self.scan_results['available_designs'].keys())
+                if available:
+                    available_start = min(available)
+                    available_end = max(available)
+                    
+                    if end < available_start or start > available_end:
+                        messagebox.showwarning("Range Warning", 
+                            f"Specified range {start}-{end} has no overlap with available designs {available_start}-{available_end}")
+                        return False
+                    
+                    # Show how many designs will be included
+                    overlapping = [d for d in available if start <= d <= end]
+                    messagebox.showinfo("Range Validation", 
+                        f"✅ Range {start}-{end} is valid\n"
+                        f"Will include {len(overlapping)} designs from available data")
+            else:
+                messagebox.showinfo("Range Validation", 
+                    f"✅ Range {start}-{end} looks valid\n"
+                    f"Run scan to verify against available designs")
+                    
+            return True
             
-            # Identify columns to scale
-            columns_to_scale = []
-            
-            if self.scale_params_var.get():
-                param_cols = [col for col in self.combined_data.columns if col.startswith(('K4_', 'K5_', 'K6_'))]
-                columns_to_scale.extend(param_cols)
-            
-            if self.scale_features_var.get():
-                feature_cols = [col for col in self.combined_data.columns if col.startswith(('ACCE_', 'DISP_'))]
-                columns_to_scale.extend(feature_cols)
-            
-            if self.scale_cbush_var.get():
-                cbush_cols = [col for col in self.combined_data.columns if col.startswith('cbush_') and col.endswith('_loose')]
-                columns_to_scale.extend(cbush_cols)
-            
-            if not columns_to_scale:
-                messagebox.showwarning("No Columns", "Please select at least one column type to scale")
-                return
-            
-            # Create scaled copy
-            self.scaled_data = self.combined_data.copy()
-            
-            # Apply scaling
-            scaled_values = scaler.fit_transform(self.combined_data[columns_to_scale])
-            self.scaled_data[columns_to_scale] = scaled_values
-            
-            # Show before/after statistics
-            self.show_scaling_comparison(columns_to_scale[:10])  # Show first 10 for brevity
-            
-            self.log_message(f"✅ Applied {method_name} to {len(columns_to_scale)} columns")
-            
-        except ImportError:
-            messagebox.showerror("Missing Library", "sklearn not installed. Please install: pip install scikit-learn")
-        except Exception as e:
-            messagebox.showerror("Scaling Error", f"Failed to apply scaling: {str(e)}")
-    
-    def show_scaling_comparison(self, sample_columns):
-        """Show before/after scaling statistics."""
-        if self.combined_data is None or not hasattr(self, 'scaled_data'):
-            return
-        
-        # Clear previous results
-        self.before_scaling_text.delete('1.0', tk.END)
-        self.after_scaling_text.delete('1.0', tk.END)
-        
-        # Before scaling statistics
-        self.before_scaling_text.insert(tk.END, "BEFORE SCALING STATISTICS:\n")
-        self.before_scaling_text.insert(tk.END, "=" * 40 + "\n\n")
-        
-        for col in sample_columns:
-            if col in self.combined_data.columns:
-                data = self.combined_data[col]
-                stats = f"{col}:\n"
-                stats += f"  Mean: {data.mean():.4f}\n"
-                stats += f"  Std:  {data.std():.4f}\n"
-                stats += f"  Min:  {data.min():.4f}\n"
-                stats += f"  Max:  {data.max():.4f}\n\n"
-                self.before_scaling_text.insert(tk.END, stats)
-        
-        # After scaling statistics
-        self.after_scaling_text.insert(tk.END, "AFTER SCALING STATISTICS:\n")
-        self.after_scaling_text.insert(tk.END, "=" * 40 + "\n\n")
-        
-        for col in sample_columns:
-            if col in self.scaled_data.columns:
-                data = self.scaled_data[col]
-                stats = f"{col}:\n"
-                stats += f"  Mean: {data.mean():.4f}\n"
-                stats += f"  Std:  {data.std():.4f}\n"
-                stats += f"  Min:  {data.min():.4f}\n"
-                stats += f"  Max:  {data.max():.4f}\n\n"
-                self.after_scaling_text.insert(tk.END, stats)
-    
-    def save_scaled_data(self):
-        """Save scaled data to file."""
-        if not hasattr(self, 'scaled_data'):
-            messagebox.showwarning("No Scaled Data", "Please apply scaling first")
-            return
-        
-        # Get save filename
-        filename = filedialog.asksaveasfilename(
-            title="Save Scaled Dataset",
-            defaultextension=".csv",
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Please enter valid numbers for Start and End")
+            return False
+   
+    def create_processing_tab(self):
+        """Create data processing tab."""
+        processing_frame = ttk.Frame(self.notebook)
+        self.notebook.add(processing_frame, text="⚙️ Process Data")
+       
+        # Processing controls
+        process_control_frame = ttk.LabelFrame(processing_frame, text="Study Processing")
+        process_control_frame.pack(fill='x', padx=20, pady=15)
+       
+        tk.Label(process_control_frame, text="Process detected study with feature extraction:",
+                font=('Arial', 12)).pack(anchor='w', padx=10, pady=10)
+       
+        process_button_frame = tk.Frame(process_control_frame)
+        process_button_frame.pack(fill='x', padx=10, pady=15)
+       
+        tk.Button(process_button_frame, text="⚙️ Process Study",
+                 command=self.process_study,
+                 bg='#27ae60', fg='white', font=('Arial', 14, 'bold'),
+                 height=2, width=20).pack(side='left')
+       
+        tk.Button(process_button_frame, text="⏸️ Pause",
+                 command=self.pause_processing,
+                 bg='#f39c12', fg='white', font=('Arial', 12, 'bold'),
+                 height=2, width=10).pack(side='left', padx=10)
+       
+        tk.Button(process_button_frame, text="⏹️ Stop",
+                 command=self.stop_processing,
+                 bg='#e74c3c', fg='white', font=('Arial', 12, 'bold'),
+                 height=2, width=10).pack(side='left', padx=5)
+       
+        # Processing progress
+        progress_frame = tk.Frame(process_control_frame)
+        progress_frame.pack(fill='x', padx=10, pady=10)
+       
+        tk.Label(progress_frame, text="Processing Progress:", font=('Arial', 11, 'bold')).pack(anchor='w')
+       
+        self.process_progress_var = tk.DoubleVar()
+        self.process_progress_bar = ttk.Progressbar(progress_frame, variable=self.process_progress_var,
+                                                  maximum=100, length=500)
+        self.process_progress_bar.pack(pady=5)
+       
+        self.process_status_label = tk.Label(progress_frame, text="Ready to process",
+                                           font=('Arial', 10), fg='#7f8c8d')
+        self.process_status_label.pack()
+       
+        # Processing stats
+        stats_frame = ttk.LabelFrame(processing_frame, text="Processing Statistics")
+        stats_frame.pack(fill='both', expand=True, padx=20, pady=15)
+       
+        self.stats_text = scrolledtext.ScrolledText(stats_frame, height=20, width=120,
+                                                   font=('Consolas', 9))
+        self.stats_text.pack(fill='both', expand=True, padx=10, pady=10)
+   
+    def create_matrix_tab(self):
+        """Create ENHANCED matrix creation tab with CSV upload capability."""
+        matrix_frame = ttk.Frame(self.notebook)
+        self.notebook.add(matrix_frame, text="📊 Create/Load Matrix")
+       
+        # ⭐ NEW: CSV Upload Section
+        upload_frame = ttk.LabelFrame(matrix_frame, text="📁 Load Existing Feature Matrix")
+        upload_frame.pack(fill='x', padx=20, pady=15)
+       
+        tk.Label(upload_frame, text="Load pre-computed feature matrix from CSV file:",
+                font=('Arial', 12, 'bold')).pack(anchor='w', padx=10, pady=5)
+       
+        upload_controls = tk.Frame(upload_frame)
+        upload_controls.pack(fill='x', padx=10, pady=10)
+       
+        tk.Button(upload_controls, text="📁 Load Matrix CSV",
+                 command=self.load_matrix_csv,
+                 bg='#9b59b6', fg='white', font=('Arial', 12, 'bold'),
+                 height=2, width=20).pack(side='left')
+       
+        # Upload options
+        self.upload_option = tk.StringVar(value="replace")
+        tk.Label(upload_controls, text="Action:", font=('Arial', 11, 'bold')).pack(side='left', padx=(20,5))
+        tk.Radiobutton(upload_controls, text="Replace", variable=self.upload_option, value="replace",
+                      font=('Arial', 10)).pack(side='left')
+        tk.Radiobutton(upload_controls, text="Append", variable=self.upload_option, value="append",
+                      font=('Arial', 10)).pack(side='left')
+        tk.Radiobutton(upload_controls, text="Smart Merge", variable=self.upload_option, value="merge",
+                      font=('Arial', 10)).pack(side='left')
+       
+        # Upload status
+        self.upload_status = tk.Label(upload_frame, text="No CSV loaded",
+                                     font=('Arial', 10), fg='#7f8c8d')
+        self.upload_status.pack(padx=10, pady=5)
+       
+        # Matrix creation controls (existing functionality)
+        matrix_control_frame = ttk.LabelFrame(matrix_frame, text="Create Matrix from Processed Data")
+        matrix_control_frame.pack(fill='x', padx=20, pady=15)
+       
+        tk.Label(matrix_control_frame, text="Create master feature matrix from processed study data:",
+                font=('Arial', 12)).pack(anchor='w', padx=10, pady=10)
+       
+        # Matrix options
+        options_frame = tk.Frame(matrix_control_frame)
+        options_frame.pack(fill='x', padx=10, pady=10)
+       
+        tk.Label(options_frame, text="Matrix Strategy:", font=('Arial', 11, 'bold')).pack(anchor='w')
+       
+        self.matrix_strategy = tk.StringVar(value="smart_combined")
+        strategies = [
+            ("Smart Combined (Recommended)", "smart_combined"),
+            ("Complete Combined", "complete_combined"),
+            ("Size Limited", "size_limited")
+        ]
+       
+        for text, value in strategies:
+            tk.Radiobutton(options_frame, text=text, variable=self.matrix_strategy, value=value,
+                          font=('Arial', 10)).pack(anchor='w', padx=20, pady=2)
+       
+        # Create matrix button
+        create_button_frame = tk.Frame(matrix_control_frame)
+        create_button_frame.pack(fill='x', padx=10, pady=15)
+       
+        tk.Button(create_button_frame, text="📊 Create Master Matrix",
+                 command=self.create_matrix,
+                 bg='#3498db', fg='white', font=('Arial', 14, 'bold'),
+                 height=2, width=25).pack(side='left')
+       
+        tk.Button(create_button_frame, text="💾 Save Matrix",
+                 command=self.save_matrix,
+                 bg='#16a085', fg='white', font=('Arial', 12, 'bold'),
+                 height=2, width=15).pack(side='left', padx=10)
+       
+        # Matrix information display
+        self.matrix_info_text = scrolledtext.ScrolledText(matrix_frame, height=20, width=120,
+                                                         font=('Consolas', 9))
+        self.matrix_info_text.pack(fill='both', expand=True, padx=20, pady=15)
+   
+    def create_ml_tab(self):
+        """Create ENHANCED machine learning tab with ML Trinity."""
+        ml_frame = ttk.Frame(self.notebook)
+        self.notebook.add(ml_frame, text="🤖 ML Trinity")
+       
+        # ML Trinity controls
+        ml_control_frame = ttk.LabelFrame(ml_frame, text="🚀 ML Trinity Training (RF + XGBoost + Ensemble)")
+        ml_control_frame.pack(fill='x', padx=20, pady=15)
+       
+        # Information display
+        info_text = ("Train all three models simultaneously:\n"
+                    "🌲 Random Forest (Interpretable Baseline)\n"
+                    "🚀 XGBoost (Performance Champion)\n"
+                    "🎯 Ensemble (Best of Both Worlds)")
+        tk.Label(ml_control_frame, text=info_text, font=('Arial', 11), justify='left').pack(anchor='w', padx=10, pady=10)
+       
+        # Training controls
+        training_controls = tk.Frame(ml_control_frame)
+        training_controls.pack(fill='x', padx=10, pady=15)
+       
+        tk.Button(training_controls, text="🚀 Train ML Trinity",
+                 command=self.train_ml_trinity,
+                 bg='#e74c3c', fg='white', font=('Arial', 14, 'bold'),
+                 height=2, width=25).pack(side='left')
+       
+        # Model comparison button
+        tk.Button(training_controls, text="📊 Compare Models",
+                 command=self.compare_models,
+                 bg='#9b59b6', fg='white', font=('Arial', 12, 'bold'),
+                 height=2, width=15).pack(side='left', padx=10)
+       
+        # Training progress
+        training_progress_frame = tk.Frame(ml_control_frame)
+        training_progress_frame.pack(fill='x', padx=10, pady=10)
+       
+        self.training_progress_var = tk.DoubleVar()
+        self.training_progress_bar = ttk.Progressbar(training_progress_frame, variable=self.training_progress_var,
+                                                   maximum=100, length=500, mode='indeterminate')
+        self.training_progress_bar.pack(pady=5)
+       
+        self.training_status_label = tk.Label(training_progress_frame, text="No models trained",
+                                            font=('Arial', 10), fg='#7f8c8d')
+        self.training_status_label.pack()
+       
+        # Results display
+        self.ml_results_text = scrolledtext.ScrolledText(ml_frame, height=20, width=120,
+                                                        font=('Consolas', 9))
+        self.ml_results_text.pack(fill='both', expand=True, padx=20, pady=15)
+   
+    def create_scoring_tab(self):
+        """Create comprehensive scoring tab."""
+        scoring_frame = ttk.Frame(self.notebook)
+        self.notebook.add(scoring_frame, text="📈 Scoring")
+       
+        # Scoring controls
+        scoring_control_frame = ttk.LabelFrame(scoring_frame, text="Comprehensive Model Scoring")
+        scoring_control_frame.pack(fill='x', padx=20, pady=15)
+       
+        tk.Button(scoring_control_frame, text="📈 Calculate Comprehensive Scores",
+                 command=self.calculate_scores,
+                 bg='#3498db', fg='white', font=('Arial', 14, 'bold'),
+                 height=2, width=30).pack(pady=15)
+       
+        # Scoring results
+        self.scoring_results_text = scrolledtext.ScrolledText(scoring_frame, height=25, width=120,
+                                                             font=('Consolas', 9))
+        self.scoring_results_text.pack(fill='both', expand=True, padx=20, pady=15)
+   
+    def create_results_tab(self):
+        """Create results and visualization tab."""
+        results_frame = ttk.Frame(self.notebook)
+        self.notebook.add(results_frame, text="📋 Results")
+       
+        # Export controls
+        export_frame = ttk.LabelFrame(results_frame, text="Export Results")
+        export_frame.pack(fill='x', padx=20, pady=15)
+       
+        export_buttons = [
+            ("💾 Export Matrix", self.export_matrix, '#16a085'),
+            ("📊 Export Results", self.export_results, '#9b59b6'),
+            ("🤖 Export Models", self.export_models, '#e74c3c'),
+            ("🎯 Export Predictions", self.export_predictions, '#f39c12')
+        ]
+       
+        button_frame = tk.Frame(export_frame)
+        button_frame.pack(fill='x', padx=10, pady=10)
+       
+        for text, command, color in export_buttons:
+            tk.Button(button_frame, text=text, command=command, bg=color, fg='white',
+                     font=('Arial', 12, 'bold')).pack(side='left', padx=10, pady=5)
+       
+        # Results summary
+        self.results_text = scrolledtext.ScrolledText(results_frame, height=25, width=120,
+                                                     font=('Consolas', 9))
+        self.results_text.pack(fill='both', expand=True, padx=20, pady=15)
+   
+    # ⭐ NEW: CSV Upload Methods
+    def load_matrix_csv(self):
+        """Load existing feature matrix from CSV file."""
+        filename = filedialog.askopenfilename(
+            title="Load Feature Matrix CSV",
             filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")]
         )
-        
+       
         if filename:
             try:
-                self.scaled_data.to_csv(filename, index=False)
-                self.log_message(f"💾 Scaled data saved: {Path(filename).name}")
-                messagebox.showinfo("Success", f"Scaled data saved successfully!\n\n{Path(filename).name}")
-            except Exception as e:
-                messagebox.showerror("Save Error", f"Failed to save scaled data: {str(e)}")
-    
-    def generate_correlation(self):
-        """Generate correlation matrix for selected features."""
-        if self.combined_data is None:
-            messagebox.showwarning("No Data", "Please process a study first")
-            return
-        
-        try:
-            # Use scaled data if available, otherwise original
-            data = self.scaled_data if hasattr(self, 'scaled_data') else self.combined_data
-            
-            # Get target variable
-            target = self.correlation_target_var.get()
-            if target not in data.columns:
-                messagebox.showwarning("Invalid Target", f"Target '{target}' not found in data")
-                return
-            
-            # Identify columns to include
-            columns_to_analyze = [target]  # Always include target
-            
-            if self.corr_params_var.get():
-                param_cols = [col for col in data.columns if col.startswith(('K4_', 'K5_', 'K6_'))]
-                columns_to_analyze.extend(param_cols)
-            
-            if self.corr_features_var.get():
-                feature_cols = [col for col in data.columns if col.startswith(('ACCE_', 'DISP_'))]
-                columns_to_analyze.extend(feature_cols)
-            
-            if self.corr_cbush_var.get():
-                cbush_cols = [col for col in data.columns if col.startswith('cbush_') and col.endswith('_loose')]
-                columns_to_analyze.extend(cbush_cols)
-            
-            # Remove duplicates and ensure target is included
-            columns_to_analyze = list(set(columns_to_analyze))
-            
-            if len(columns_to_analyze) < 2:
-                messagebox.showwarning("Insufficient Columns", "Select at least one feature type for correlation analysis")
-                return
-            
-            # Calculate correlations with target
-            correlations = data[columns_to_analyze].corr()[target].drop(target).abs().sort_values(ascending=False)
-            
-            # Display results
-            self.correlation_text.delete('1.0', tk.END)
-            self.correlation_text.insert(tk.END, f"CORRELATION WITH {target}:\n")
-            self.correlation_text.insert(tk.END, "=" * 50 + "\n\n")
-            
-            data_source = "SCALED DATA" if hasattr(self, 'scaled_data') else "RAW DATA"
-            self.correlation_text.insert(tk.END, f"Source: {data_source}\n")
-            self.correlation_text.insert(tk.END, f"Features analyzed: {len(columns_to_analyze)-1}\n\n")
-            
-            self.correlation_text.insert(tk.END, "TOP CORRELATIONS:\n")
-            self.correlation_text.insert(tk.END, "-" * 30 + "\n")
-            
-            for feature, corr_value in correlations.head(20).items():
-                self.correlation_text.insert(tk.END, f"{feature:<25} {corr_value:.4f}\n")
-            
-            self.log_message(f"🔥 Generated correlation matrix for {target}")
-            
-        except Exception as e:
-            messagebox.showerror("Correlation Error", f"Failed to generate correlation matrix: {str(e)}")
-    
-    def generate_ai_suggestions(self):
-        """Generate AI-powered feature suggestions."""
-        if self.combined_data is None:
-            messagebox.showwarning("No Data", "Please process a study first")
-            return
-        
-        try:
-            # Use scaled data if available, otherwise original
-            data = self.scaled_data if hasattr(self, 'scaled_data') else self.combined_data
-            
-            # Get target variable
-            target = self.correlation_target_var.get()
-            if target not in data.columns:
-                messagebox.showwarning("Invalid Target", f"Target '{target}' not found in data")
-                return
-            
-            # Calculate correlations
-            numeric_data = data.select_dtypes(include=[np.number])
-            if target not in numeric_data.columns:
-                messagebox.showwarning("Invalid Target", f"Target '{target}' is not numeric")
-                return
-            
-            correlations = numeric_data.corr()[target].drop(target).abs().sort_values(ascending=False)
-            
-            # Generate AI insights
-            self.ai_suggestions_text.delete('1.0', tk.END)
-            self.ai_suggestions_text.insert(tk.END, f"🧠 AI INSIGHTS FOR {target}:\n")
-            self.ai_suggestions_text.insert(tk.END, "=" * 50 + "\n\n")
-            
-            data_source = "SCALED" if hasattr(self, 'scaled_data') else "RAW"
-            self.ai_suggestions_text.insert(tk.END, f"Analysis of: {data_source} DATA\n\n")
-            
-            # Top overall features
-            top_feature = correlations.index[0]
-            top_corr = correlations.iloc[0]
-            
-            self.ai_suggestions_text.insert(tk.END, "🎯 TOP RECOMMENDATION:\n")
-            self.ai_suggestions_text.insert(tk.END, f"Feature: {top_feature}\n")
-            self.ai_suggestions_text.insert(tk.END, f"Correlation: {top_corr:.4f}\n\n")
-            
-            # Categorized suggestions
-            param_features = [f for f in correlations.index if f.startswith(('K4_', 'K5_', 'K6_'))]
-            accel_features = [f for f in correlations.index if f.startswith('ACCE_')]
-            disp_features = [f for f in correlations.index if f.startswith('DISP_')]
-            
-            if param_features:
-                self.ai_suggestions_text.insert(tk.END, "🔧 TOP PARAMETERS:\n")
-                for feat in param_features[:3]:
-                    self.ai_suggestions_text.insert(tk.END, f"  {feat}: {correlations[feat]:.4f}\n")
-                self.ai_suggestions_text.insert(tk.END, "\n")
-            
-            if accel_features:
-                self.ai_suggestions_text.insert(tk.END, "📈 TOP ACCELERATIONS:\n")
-                for feat in accel_features[:3]:
-                    self.ai_suggestions_text.insert(tk.END, f"  {feat}: {correlations[feat]:.4f}\n")
-                self.ai_suggestions_text.insert(tk.END, "\n")
-            
-            if disp_features:
-                self.ai_suggestions_text.insert(tk.END, "📏 TOP DISPLACEMENTS:\n")
-                for feat in disp_features[:3]:
-                    self.ai_suggestions_text.insert(tk.END, f"  {feat}: {correlations[feat]:.4f}\n")
-                self.ai_suggestions_text.insert(tk.END, "\n")
-            
-            # AI interpretation
-            self.ai_suggestions_text.insert(tk.END, "💡 AI INTERPRETATION:\n")
-            if top_feature.startswith(('K4_', 'K5_', 'K6_')):
-                self.ai_suggestions_text.insert(tk.END, f"The stiffness parameter {top_feature} shows strongest correlation.\n")
-                self.ai_suggestions_text.insert(tk.END, "This suggests the bolt's inherent stiffness directly impacts looseness.\n")
-            elif top_feature.startswith('ACCE_'):
-                self.ai_suggestions_text.insert(tk.END, f"Acceleration response {top_feature} is most predictive.\n")
-                self.ai_suggestions_text.insert(tk.END, "Dynamic response patterns reveal structural behavior changes.\n")
-            elif top_feature.startswith('DISP_'):
-                self.ai_suggestions_text.insert(tk.END, f"Displacement response {top_feature} is most predictive.\n")
-                self.ai_suggestions_text.insert(tk.END, "Structural deformation patterns indicate loose connections.\n")
-            
-            # Update target combo with available targets
-            cbush_targets = [col for col in data.columns if col.startswith('cbush_') and col.endswith('_loose')]
-            self.target_combo['values'] = cbush_targets
-            
-            self.log_message(f"🧠 Generated AI suggestions for {target}")
-            
-        except Exception as e:
-            messagebox.showerror("AI Analysis Error", f"Failed to generate AI suggestions: {str(e)}")
-    
-    def create_control_widgets(self, parent):
-        """Create the control widgets in the left panel."""
-        # File selection frame
-        file_frame = ttk.LabelFrame(parent, text="📁 File Selection")
-        file_frame.pack(fill='x', pady=10)
-        
-        # Parameter file
-        param_frame = tk.Frame(file_frame)
-        param_frame.pack(fill='x', padx=10, pady=5)
-        tk.Label(param_frame, text="Parameter File (CSV/TSV):", font=('Arial', 10, 'bold')).pack(anchor='w')
-        param_input_frame = tk.Frame(param_frame)
-        param_input_frame.pack(fill='x', pady=2)
-        tk.Entry(param_input_frame, textvariable=self.param_file_var, width=50, font=('Arial', 9)).pack(side='left', fill='x', expand=True)
-        tk.Button(param_input_frame, text="Browse", command=self.browse_param_file, 
-                 bg='#3498db', fg='white', font=('Arial', 9, 'bold')).pack(side='right', padx=(5,0))
-        
-        # Feature matrix file
-        matrix_frame = tk.Frame(file_frame)
-        matrix_frame.pack(fill='x', padx=10, pady=5)
-        tk.Label(matrix_frame, text="Feature Matrix File (CSV):", font=('Arial', 10, 'bold')).pack(anchor='w')
-        matrix_input_frame = tk.Frame(matrix_frame)
-        matrix_input_frame.pack(fill='x', pady=2)
-        tk.Entry(matrix_input_frame, textvariable=self.matrix_file_var, width=50, font=('Arial', 9)).pack(side='left', fill='x', expand=True)
-        tk.Button(matrix_input_frame, text="Browse", command=self.browse_matrix_file,
-                 bg='#3498db', fg='white', font=('Arial', 9, 'bold')).pack(side='right', padx=(5,0))
-        
-        # HEEDS directory
-        heeds_frame = tk.Frame(file_frame)
-        heeds_frame.pack(fill='x', padx=10, pady=5)
-        tk.Label(heeds_frame, text="HEEDS Directory (containing POST_0):", font=('Arial', 10, 'bold')).pack(anchor='w')
-        heeds_input_frame = tk.Frame(heeds_frame)
-        heeds_input_frame.pack(fill='x', pady=2)
-        tk.Entry(heeds_input_frame, textvariable=self.heeds_dir_var, width=50, font=('Arial', 9)).pack(side='left', fill='x', expand=True)
-        tk.Button(heeds_input_frame, text="Browse", command=self.browse_heeds_dir,
-                 bg='#3498db', fg='white', font=('Arial', 9, 'bold')).pack(side='right', padx=(5,0))
-        
-        # Settings frame
-        settings_frame = ttk.LabelFrame(parent, text="⚙️ Processing Settings")
-        settings_frame.pack(fill='x', pady=10)
-        
-        # Study name
-        study_frame = tk.Frame(settings_frame)
-        study_frame.pack(fill='x', padx=10, pady=5)
-        tk.Label(study_frame, text="Study Name:", font=('Arial', 10, 'bold')).pack(anchor='w')
-        tk.Entry(study_frame, textvariable=self.study_name_var, width=40, font=('Arial', 9)).pack(fill='x', pady=2)
-        
-        # Output directory
-        output_frame = tk.Frame(settings_frame)
-        output_frame.pack(fill='x', padx=10, pady=5)
-        tk.Label(output_frame, text="Output Directory:", font=('Arial', 10, 'bold')).pack(anchor='w')
-        output_input_frame = tk.Frame(output_frame)
-        output_input_frame.pack(fill='x', pady=2)
-        tk.Entry(output_input_frame, textvariable=self.output_dir_var, width=30, font=('Arial', 9)).pack(side='left', fill='x', expand=True)
-        tk.Button(output_input_frame, text="Browse", command=self.browse_output_dir,
-                 bg='#95a5a6', fg='white', font=('Arial', 8, 'bold')).pack(side='right', padx=(5,0))
-        
-        # Options
-        options_frame = tk.Frame(settings_frame)
-        options_frame.pack(fill='x', padx=10, pady=5)
-        tk.Checkbutton(options_frame, text="Validate final dataset", variable=self.validate_var,
-                      font=('Arial', 10)).pack(anchor='w')
-        
-        # CBUSH Loose Detection Threshold
-        threshold_frame = tk.Frame(settings_frame)
-        threshold_frame.pack(fill='x', padx=10, pady=5)
-        tk.Label(threshold_frame, text="CBUSH Loose Threshold:", font=('Arial', 10, 'bold')).pack(anchor='w')
-        
-        # Dropdown with presets
-        threshold_combo = ttk.Combobox(threshold_frame, textvariable=self.threshold_var, 
-                                      values=["1e5", "1e6", "1e7", "1e8", "1e9", "1e10", "1e11", "1e12", "1e13", "1e14", "Custom"],
-                                      width=15, font=('Arial', 9))
-        threshold_combo.pack(fill='x', pady=2)
-        
-        # Custom entry (hidden initially)
-        self.custom_entry = tk.Entry(threshold_frame, textvariable=self.custom_threshold_var, font=('Arial', 9))
-        self.custom_entry.pack(fill='x', pady=2)
-        self.custom_entry.pack_forget()  # Hidden initially
-        
-        # Bind event to show/hide custom entry
-        threshold_combo.bind('<<ComboboxSelected>>', self.on_threshold_change)
-        
-        # Add tooltip explanation
-        tooltip_label = tk.Label(threshold_frame, text="Values below threshold are considered 'loose'", 
-                               font=('Arial', 8), fg='#666666')
-        tooltip_label.pack(anchor='w')
-        
-        # Processing controls
-        control_frame = ttk.LabelFrame(parent, text="🚀 Processing Controls")
-        control_frame.pack(fill='x', pady=10)
-        
-        button_frame = tk.Frame(control_frame)
-        button_frame.pack(fill='x', padx=10, pady=10)
-        
-        tk.Button(button_frame, text="🔄 Process Study", command=self.process_single_study,
-                 bg='#27ae60', fg='white', font=('Arial', 11, 'bold'), height=1, width=18).pack(fill='x', pady=2)
-        
-        tk.Button(button_frame, text="📋 Clear All", command=self.clear_all_inputs,
-                 bg='#f39c12', fg='white', font=('Arial', 11, 'bold'), height=1, width=18).pack(fill='x', pady=2)
-        
-        # Combine Studies section
-        combine_frame = ttk.LabelFrame(parent, text="🔗 Combine Studies")
-        combine_frame.pack(fill='x', pady=10)
-        
-        # Study 1 selection
-        study1_frame = tk.Frame(combine_frame)
-        study1_frame.pack(fill='x', padx=10, pady=5)
-        tk.Label(study1_frame, text="Study File 1:", font=('Arial', 10, 'bold')).pack(anchor='w')
-        study1_input_frame = tk.Frame(study1_frame)
-        study1_input_frame.pack(fill='x', pady=2)
-        tk.Entry(study1_input_frame, textvariable=self.study1_file_var, width=40, font=('Arial', 9)).pack(side='left', fill='x', expand=True)
-        tk.Button(study1_input_frame, text="Browse", command=self.browse_study1_file,
-                 bg='#9b59b6', fg='white', font=('Arial', 9, 'bold')).pack(side='right', padx=(5,0))
-        
-        # Study 2 selection
-        study2_frame = tk.Frame(combine_frame)
-        study2_frame.pack(fill='x', padx=10, pady=5)
-        tk.Label(study2_frame, text="Study File 2:", font=('Arial', 10, 'bold')).pack(anchor='w')
-        study2_input_frame = tk.Frame(study2_frame)
-        study2_input_frame.pack(fill='x', pady=2)
-        tk.Entry(study2_input_frame, textvariable=self.study2_file_var, width=40, font=('Arial', 9)).pack(side='left', fill='x', expand=True)
-        tk.Button(study2_input_frame, text="Browse", command=self.browse_study2_file,
-                 bg='#9b59b6', fg='white', font=('Arial', 9, 'bold')).pack(side='right', padx=(5,0))
-        
-        # Combine button
-        combine_button_frame = tk.Frame(combine_frame)
-        combine_button_frame.pack(fill='x', padx=10, pady=10)
-        tk.Button(combine_button_frame, text="🔗 Combine Selected Studies", command=self.combine_two_studies,
-                 bg='#e74c3c', fg='white', font=('Arial', 11, 'bold'), height=1, width=25).pack()
-        
-        tk.Button(button_frame, text="📋 Clear Log", command=self.clear_log,
-                 bg='#95a5a6', fg='white', font=('Arial', 9, 'bold'), height=1, width=18).pack(fill='x', pady=2)
-        
-        # Progress frame
-        progress_frame = ttk.LabelFrame(parent, text="📊 Progress")
-        progress_frame.pack(fill='x', pady=10)
-        
-        self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_var, 
-                                          maximum=100, length=300, mode='indeterminate')
-        self.progress_bar.pack(pady=10)
-        
-        self.status_label = tk.Label(progress_frame, text="Ready", font=('Arial', 10), fg='#7f8c8d')
-        self.status_label.pack()
-        
-        # Log frame
-        log_frame = ttk.LabelFrame(parent, text="📜 Processing Log")
-        log_frame.pack(fill='both', expand=True, pady=10)
-        
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=12, width=60, 
-                                                 font=('Consolas', 8))
-        self.log_text.pack(fill='both', expand=True, padx=10, pady=10)
-    
-    def create_data_preview_tabs(self, parent):
-        """Create the data preview tabs in the right panel."""
-        # Create notebook for data preview tabs
-        self.preview_notebook = ttk.Notebook(parent)
-        self.preview_notebook.pack(fill='both', expand=True)
-        
-        # Tab 1: Parameter File Preview
-        self.param_tab = ttk.Frame(self.preview_notebook)
-        self.preview_notebook.add(self.param_tab, text="📋 Parameter File")
-        self.create_param_preview_tab(self.param_tab)
-        
-        # Tab 2: Feature Matrix Preview
-        self.matrix_tab = ttk.Frame(self.preview_notebook)
-        self.preview_notebook.add(self.matrix_tab, text="📈 Feature Matrix")
-        self.create_matrix_preview_tab(self.matrix_tab)
-        
-        # Tab 3: Full Feature Matrix (Combined)
-        self.combined_tab = ttk.Frame(self.preview_notebook)
-        self.preview_notebook.add(self.combined_tab, text="🔗 Full Feature Matrix")
-        self.create_combined_preview_tab(self.combined_tab)
-        
-        # Tab 4: Feature Scaling
-        self.scaling_tab = ttk.Frame(self.preview_notebook)
-        self.preview_notebook.add(self.scaling_tab, text="📏 Feature Scaling")
-        self.create_scaling_tab(self.scaling_tab)
-        
-        # Tab 5: Correlation Matrix
-        self.correlation_tab = ttk.Frame(self.preview_notebook)
-        self.preview_notebook.add(self.correlation_tab, text="🔥 Correlation Matrix")
-        self.create_correlation_tab(self.correlation_tab)
-        
-        # Tab 5: Heatmap Visualization
-        self.heatmap_tab = ttk.Frame(self.preview_notebook)
-        self.preview_notebook.add(self.heatmap_tab, text="🔥 Heatmap")
-        self.create_heatmap_tab(self.heatmap_tab)
-        
-        # Tab 6: Load Full Feature Matrix
-        self.load_tab = ttk.Frame(self.preview_notebook)
-        self.preview_notebook.add(self.load_tab, text="📁 Load Full Matrix")
-        self.create_load_preview_tab(self.load_tab)
-    
-    def create_param_preview_tab(self, parent):
-        """Create parameter file preview tab."""
-        # Info frame
-        info_frame = tk.Frame(parent)
-        info_frame.pack(fill='x', padx=10, pady=5)
-        
-        self.param_info_label = tk.Label(info_frame, text="No parameter file loaded", 
-                                        font=('Arial', 11, 'bold'), fg='#7f8c8d')
-        self.param_info_label.pack(anchor='w')
-        
-        # Table frame with proper scrollbar layout
-        table_frame = tk.Frame(parent)
-        table_frame.pack(fill='both', expand=True, padx=10, pady=5)
-        
-        # Create treeview for data display
-        self.param_tree = ttk.Treeview(table_frame, show='headings', height=20)
-        
-        # Create scrollbars
-        param_v_scroll = ttk.Scrollbar(table_frame, orient='vertical', command=self.param_tree.yview)
-        param_h_scroll = ttk.Scrollbar(table_frame, orient='horizontal', command=self.param_tree.xview)
-        
-        # Configure treeview to use scrollbars
-        self.param_tree.configure(yscrollcommand=param_v_scroll.set, xscrollcommand=param_h_scroll.set)
-        
-        # Grid layout for proper scrollbar positioning
-        table_frame.grid_rowconfigure(0, weight=1)
-        table_frame.grid_columnconfigure(0, weight=1)
-        
-        self.param_tree.grid(row=0, column=0, sticky='nsew')
-        param_v_scroll.grid(row=0, column=1, sticky='ns')
-        param_h_scroll.grid(row=1, column=0, sticky='ew')
-    
-    def create_matrix_preview_tab(self, parent):
-        """Create feature matrix preview tab."""
-        # Info frame
-        info_frame = tk.Frame(parent)
-        info_frame.pack(fill='x', padx=10, pady=5)
-        
-        self.matrix_info_label = tk.Label(info_frame, text="No feature matrix loaded", 
-                                         font=('Arial', 11, 'bold'), fg='#7f8c8d')
-        self.matrix_info_label.pack(anchor='w')
-        
-        # Table frame with proper scrollbar layout
-        table_frame = tk.Frame(parent)
-        table_frame.pack(fill='both', expand=True, padx=10, pady=5)
-        
-        # Create treeview for data display
-        self.matrix_tree = ttk.Treeview(table_frame, show='headings', height=20)
-        
-        # Create scrollbars
-        matrix_v_scroll = ttk.Scrollbar(table_frame, orient='vertical', command=self.matrix_tree.yview)
-        matrix_h_scroll = ttk.Scrollbar(table_frame, orient='horizontal', command=self.matrix_tree.xview)
-        
-        # Configure treeview to use scrollbars
-        self.matrix_tree.configure(yscrollcommand=matrix_v_scroll.set, xscrollcommand=matrix_h_scroll.set)
-        
-        # Grid layout for proper scrollbar positioning
-        table_frame.grid_rowconfigure(0, weight=1)
-        table_frame.grid_columnconfigure(0, weight=1)
-        
-        self.matrix_tree.grid(row=0, column=0, sticky='nsew')
-        matrix_v_scroll.grid(row=0, column=1, sticky='ns')
-        matrix_h_scroll.grid(row=1, column=0, sticky='ew')
-    
-    def create_combined_preview_tab(self, parent):
-        """Create combined data preview tab."""
-        # Info frame
-        info_frame = tk.Frame(parent)
-        info_frame.pack(fill='x', padx=10, pady=5)
-        
-        self.combined_info_label = tk.Label(info_frame, text="No combined data available - process a study first", 
-                                           font=('Arial', 11, 'bold'), fg='#7f8c8d')
-        self.combined_info_label.pack(anchor='w')
-        
-        # Table frame with proper scrollbar layout
-        table_frame = tk.Frame(parent)
-        table_frame.pack(fill='both', expand=True, padx=10, pady=5)
-        
-        # Create treeview for data display
-        self.combined_tree = ttk.Treeview(table_frame, show='headings', height=20)
-        
-        # Create scrollbars
-        combined_v_scroll = ttk.Scrollbar(table_frame, orient='vertical', command=self.combined_tree.yview)
-        combined_h_scroll = ttk.Scrollbar(table_frame, orient='horizontal', command=self.combined_tree.xview)
-        
-        # Configure treeview to use scrollbars
-        self.combined_tree.configure(yscrollcommand=combined_v_scroll.set, xscrollcommand=combined_h_scroll.set)
-        
-        # Grid layout for proper scrollbar positioning
-        table_frame.grid_rowconfigure(0, weight=1)
-        table_frame.grid_columnconfigure(0, weight=1)
-        
-        self.combined_tree.grid(row=0, column=0, sticky='nsew')
-        combined_v_scroll.grid(row=0, column=1, sticky='ns')
-        combined_h_scroll.grid(row=1, column=0, sticky='ew')
-    
-    def create_load_preview_tab(self, parent):
-        """Create load full matrix preview tab."""
-        # Controls frame
-        controls_frame = tk.Frame(parent)
-        controls_frame.pack(fill='x', padx=10, pady=10)
-        
-        tk.Label(controls_frame, text="Load existing Full Feature Matrix:", 
-                font=('Arial', 12, 'bold')).pack(anchor='w')
-        
-        load_button_frame = tk.Frame(controls_frame)
-        load_button_frame.pack(fill='x', pady=10)
-        
-        tk.Button(load_button_frame, text="📁 Browse Full Feature Matrix", 
-                 command=self.browse_full_matrix,
-                 bg='#e67e22', fg='white', font=('Arial', 11, 'bold'),
-                 height=2, width=30).pack(side='left')
-        
-        # Info frame
-        info_frame = tk.Frame(parent)
-        info_frame.pack(fill='x', padx=10, pady=5)
-        
-        self.load_info_label = tk.Label(info_frame, text="No full feature matrix loaded", 
-                                       font=('Arial', 11, 'bold'), fg='#7f8c8d')
-        self.load_info_label.pack(anchor='w')
-        
-        # Table frame with proper scrollbar layout
-        table_frame = tk.Frame(parent)
-        table_frame.pack(fill='both', expand=True, padx=10, pady=5)
-        
-        # Create treeview for data display
-        self.load_tree = ttk.Treeview(table_frame, show='headings', height=20)
-        
-        # Create scrollbars
-        load_v_scroll = ttk.Scrollbar(table_frame, orient='vertical', command=self.load_tree.yview)
-        load_h_scroll = ttk.Scrollbar(table_frame, orient='horizontal', command=self.load_tree.xview)
-        
-        # Configure treeview to use scrollbars
-        self.load_tree.configure(yscrollcommand=load_v_scroll.set, xscrollcommand=load_h_scroll.set)
-        
-        # Grid layout for proper scrollbar positioning
-        table_frame.grid_rowconfigure(0, weight=1)
-        table_frame.grid_columnconfigure(0, weight=1)
-        
-        self.load_tree.grid(row=0, column=0, sticky='nsew')
-        load_v_scroll.grid(row=0, column=1, sticky='ns')
-        load_h_scroll.grid(row=1, column=0, sticky='ew')
-    
-    def create_scaling_tab(self, parent):
-        """Create feature scaling tab."""
-        # Controls frame
-        controls_frame = ttk.LabelFrame(parent, text="📏 Feature Scaling Options")
-        controls_frame.pack(fill='x', padx=10, pady=10)
-        
-        # Scaling method selection
-        method_frame = tk.Frame(controls_frame)
-        method_frame.pack(fill='x', padx=10, pady=5)
-        
-        tk.Label(method_frame, text="Scaling Method:", font=('Arial', 10, 'bold')).pack(anchor='w')
-        
-        self.scaling_method_var = tk.StringVar(value="StandardScaler")
-        scaling_methods = ["StandardScaler", "MinMaxScaler", "RobustScaler", "MaxAbsScaler", "Normalizer"]
-        method_combo = ttk.Combobox(method_frame, textvariable=self.scaling_method_var, 
-                                   values=scaling_methods, width=15, font=('Arial', 9))
-        method_combo.pack(fill='x', pady=2)
-        
-        # Method descriptions
-        method_desc_frame = tk.Frame(controls_frame)
-        method_desc_frame.pack(fill='x', padx=10, pady=5)
-        
-        self.method_desc_label = tk.Label(method_desc_frame, text="StandardScaler: Mean=0, Std=1 (best for ML)", 
-                                         font=('Arial', 9), fg='#666666', wraplength=400)
-        self.method_desc_label.pack(anchor='w')
-        
-        # Bind method change to update description
-        method_combo.bind('<<ComboboxSelected>>', self.update_scaling_description)
-        
-        # Column selection frame
-        selection_frame = ttk.LabelFrame(controls_frame, text="Select Columns to Scale")
-        selection_frame.pack(fill='both', expand=True, padx=10, pady=5)
-        
-        # Column type checkboxes
-        type_frame = tk.Frame(selection_frame)
-        type_frame.pack(fill='x', padx=10, pady=5)
-        
-        self.scale_params_var = tk.BooleanVar(value=False)
-        self.scale_features_var = tk.BooleanVar(value=True)
-        self.scale_cbush_var = tk.BooleanVar(value=False)
-        
-        tk.Checkbutton(type_frame, text="Parameters (K4_X, K5_X, K6_X)", variable=self.scale_params_var,
-                      font=('Arial', 10)).pack(anchor='w')
-        tk.Checkbutton(type_frame, text="Features (ACCE_X, DISP_X)", variable=self.scale_features_var,
-                      font=('Arial', 10)).pack(anchor='w')
-        tk.Checkbutton(type_frame, text="CBUSH Labels (cbush_X_loose)", variable=self.scale_cbush_var,
-                      font=('Arial', 10)).pack(anchor='w')
-        
-        # Action buttons
-        button_frame = tk.Frame(controls_frame)
-        button_frame.pack(fill='x', padx=10, pady=10)
-        
-        tk.Button(button_frame, text="📏 Scale Selected Features", command=self.apply_scaling,
-                 bg='#e67e22', fg='white', font=('Arial', 11, 'bold'), height=1, width=25).pack(side='left', padx=5)
-        
-        tk.Button(button_frame, text="💾 Save Scaled Data", command=self.save_scaled_data,
-                 bg='#27ae60', fg='white', font=('Arial', 11, 'bold'), height=1, width=20).pack(side='left', padx=5)
-        
-        # Scaling results frame
-        results_frame = ttk.LabelFrame(parent, text="📊 Scaling Results")
-        results_frame.pack(fill='both', expand=True, padx=10, pady=10)
-        
-        # Before/After comparison
-        comparison_frame = tk.Frame(results_frame)
-        comparison_frame.pack(fill='both', expand=True, padx=10, pady=5)
-        
-        # Before scaling (left side)
-        before_frame = ttk.LabelFrame(comparison_frame, text="Before Scaling")
-        before_frame.pack(side='left', fill='both', expand=True, padx=5)
-        
-        self.before_scaling_text = scrolledtext.ScrolledText(before_frame, height=8, width=40, font=('Consolas', 8))
-        self.before_scaling_text.pack(fill='both', expand=True, padx=5, pady=5)
-        
-        # After scaling (right side)
-        after_frame = ttk.LabelFrame(comparison_frame, text="After Scaling")
-        after_frame.pack(side='right', fill='both', expand=True, padx=5)
-        
-        self.after_scaling_text = scrolledtext.ScrolledText(after_frame, height=8, width=40, font=('Consolas', 8))
-        self.after_scaling_text.pack(fill='both', expand=True, padx=5, pady=5)
-        
-        # Initialize with default description
-        self.update_scaling_description()
-    
-    def create_correlation_tab(self, parent):
-        """Create correlation matrix tab."""
-        # Controls frame
-        controls_frame = ttk.LabelFrame(parent, text="🔥 Correlation Analysis")
-        controls_frame.pack(fill='x', padx=10, pady=10)
-        
-        # Target selection
-        target_frame = tk.Frame(controls_frame)
-        target_frame.pack(fill='x', padx=10, pady=5)
-        
-        tk.Label(target_frame, text="Target Variable:", font=('Arial', 10, 'bold')).pack(anchor='w')
-        
-        self.correlation_target_var = tk.StringVar(value="cbush_2_loose")
-        self.target_combo = ttk.Combobox(target_frame, textvariable=self.correlation_target_var, 
-                                        width=20, font=('Arial', 9))
-        self.target_combo.pack(fill='x', pady=2)
-        
-        # Feature selection checkboxes
-        feature_frame = tk.Frame(controls_frame)
-        feature_frame.pack(fill='x', padx=10, pady=5)
-        
-        tk.Label(feature_frame, text="Include Features:", font=('Arial', 10, 'bold')).pack(anchor='w')
-        
-        self.corr_params_var = tk.BooleanVar(value=True)
-        self.corr_features_var = tk.BooleanVar(value=True)
-        self.corr_cbush_var = tk.BooleanVar(value=True)
-        
-        tk.Checkbutton(feature_frame, text="Parameters (K4_X, K5_X, K6_X)", variable=self.corr_params_var,
-                      font=('Arial', 10)).pack(anchor='w')
-        tk.Checkbutton(feature_frame, text="Features (ACCE_X, DISP_X)", variable=self.corr_features_var,
-                      font=('Arial', 10)).pack(anchor='w')
-        tk.Checkbutton(feature_frame, text="CBUSH Labels (cbush_X_loose)", variable=self.corr_cbush_var,
-                      font=('Arial', 10)).pack(anchor='w')
-        
-        # Analysis buttons
-        button_frame = tk.Frame(controls_frame)
-        button_frame.pack(fill='x', padx=10, pady=10)
-        
-        tk.Button(button_frame, text="🔥 Generate Correlation Matrix", command=self.generate_correlation,
-                 bg='#e74c3c', fg='white', font=('Arial', 11, 'bold'), height=1, width=25).pack(side='left', padx=5)
-        
-        tk.Button(button_frame, text="🧠 AI Feature Suggestions", command=self.generate_ai_suggestions,
-                 bg='#9b59b6', fg='white', font=('Arial', 11, 'bold'), height=1, width=20).pack(side='left', padx=5)
-        
-        # Results frame
-        results_frame = ttk.LabelFrame(parent, text="📊 Correlation Results")
-        results_frame.pack(fill='both', expand=True, padx=10, pady=10)
-        
-        # Split into correlation display and AI suggestions
-        analysis_frame = tk.Frame(results_frame)
-        analysis_frame.pack(fill='both', expand=True, padx=10, pady=5)
-        
-        # Correlation matrix (left side)
-        corr_frame = ttk.LabelFrame(analysis_frame, text="Correlation Matrix")
-        corr_frame.pack(side='left', fill='both', expand=True, padx=5)
-        
-        self.correlation_text = scrolledtext.ScrolledText(corr_frame, height=12, width=50, font=('Consolas', 8))
-        self.correlation_text.pack(fill='both', expand=True, padx=5, pady=5)
-        
-        # AI suggestions (right side)
-        ai_frame = ttk.LabelFrame(analysis_frame, text="🧠 AI Feature Insights")
-        ai_frame.pack(side='right', fill='both', expand=True, padx=5)
-        
-        self.ai_suggestions_text = scrolledtext.ScrolledText(ai_frame, height=12, width=40, font=('Consolas', 8))
-        self.ai_suggestions_text.pack(fill='both', expand=True, padx=5, pady=5)
-    
-    def populate_data_table(self, tree, data, info_label, max_rows=500):
-        """Populate a treeview with data from a DataFrame."""
-        # Clear existing data
-        for item in tree.get_children():
-            tree.delete(item)
-        
-        if data is None or data.empty:
-            info_label.config(text="No data available", fg='#e74c3c')
-            return
-        
-        # Limit rows for performance
-        display_data = data.head(max_rows)
-        
-        # Configure columns
-        columns = list(display_data.columns)
-        tree['columns'] = columns
-        
-        # Set column headings and widths
-        for col in columns:
-            tree.heading(col, text=col)
-            tree.column(col, width=100, minwidth=50)
-        
-        # Insert data
-        for index, row in display_data.iterrows():
-            values = []
-            for col in columns:
-                value = row[col]
-                # Handle different data types
-                if pd.isna(value):
-                    values.append("")
-                elif isinstance(value, (int, float)):
-                    if isinstance(value, float):
-                        values.append(f"{value:.3f}")
-                    else:
-                        values.append(str(value))
+                self.log_message(f"📁 Loading matrix from: {filename}")
+               
+                # Load CSV
+                loaded_df = pd.read_csv(filename)
+               
+                # Validate CSV structure
+                validation_result = self.validate_matrix_csv(loaded_df, filename)
+               
+                if validation_result['valid']:
+                    # Store loaded data
+                    self.loaded_data = loaded_df
+                   
+                    # Apply user-selected action
+                    action = self.upload_option.get()
+                    if action == "replace":
+                        self.current_data = loaded_df.copy()
+                        status_msg = f"✅ Matrix replaced: {len(loaded_df):,} designs loaded"
+                    elif action == "append":
+                        if self.current_data is not None:
+                            self.current_data = pd.concat([self.current_data, loaded_df], ignore_index=True)
+                            status_msg = f"✅ Matrix appended: {len(self.current_data):,} total designs"
+                        else:
+                            self.current_data = loaded_df.copy()
+                            status_msg = f"✅ Matrix loaded: {len(loaded_df):,} designs"
+                    elif action == "merge":
+                        if self.current_data is not None:
+                            self.current_data = self.smart_merge_matrices(self.current_data, loaded_df)
+                            status_msg = f"✅ Smart merge complete: {len(self.current_data):,} total designs"
+                        else:
+                            self.current_data = loaded_df.copy()
+                            status_msg = f"✅ Matrix loaded: {len(loaded_df):,} designs"
+                   
+                    self.upload_status.config(text=status_msg, fg='#27ae60')
+                    self.log_message(status_msg)
+                   
+                    # Update matrix info display
+                    self.update_matrix_info_display()
+                   
+                    messagebox.showinfo("Success", f"Matrix loaded successfully!\n{status_msg}")
                 else:
-                    values.append(str(value))
-            
-            tree.insert('', 'end', values=values)
-        
-        # Update info label
-        total_rows = len(data)
-        showing_rows = len(display_data)
-        missing_values = data.isnull().sum().sum()
-        
-        info_text = f"📊 Showing {showing_rows:,} of {total_rows:,} rows | {len(columns)} columns | {missing_values:,} missing values"
-        if showing_rows < total_rows:
-            info_text += f" | ⚠️ Limited to first {max_rows:,} rows for performance"
-        
-        info_label.config(text=info_text, fg='#27ae60')
-    
-    def load_param_file_preview(self, filename):
-        """Load and display parameter file preview."""
+                    self.upload_status.config(text="❌ Invalid CSV format", fg='#e74c3c')
+                    messagebox.showerror("Validation Error", validation_result['error'])
+                   
+            except Exception as e:
+                error_msg = f"Failed to load CSV: {str(e)}"
+                self.upload_status.config(text="❌ Load failed", fg='#e74c3c')
+                self.log_message(f"❌ {error_msg}")
+                messagebox.showerror("Load Error", error_msg)
+   
+    def validate_matrix_csv(self, df, filename):
+        """Validate loaded CSV for required structure."""
         try:
-            self.log_message(f"📋 Loading parameter file preview: {Path(filename).name}")
-            
-            # Auto-detect delimiter
-            with open(filename, 'r') as f:
-                first_line = f.readline()
-                delimiter = '\t' if '\t' in first_line else ','
-            
-            # Load data
-            self.param_data = pd.read_csv(filename, delimiter=delimiter)
-            
-            # Add heeds_design_id for reference
-            self.param_data['heeds_design_id'] = range(1, len(self.param_data) + 1)
-            
-            # Populate table
-            self.populate_data_table(self.param_tree, self.param_data, self.param_info_label)
-            
-            self.log_message(f"   ✅ Parameter preview loaded: {len(self.param_data):,} designs")
-            
+            required_metadata = ['design_id', 'study_type']
+            required_cbush_labels = [f'cbush_{i}_loose' for i in range(2, 11)]
+           
+            # Check for required columns
+            missing_metadata = [col for col in required_metadata if col not in df.columns]
+            missing_cbush = [col for col in required_cbush_labels if col not in df.columns]
+           
+            if missing_metadata:
+                return {'valid': False, 'error': f"Missing metadata columns: {missing_metadata}"}
+           
+            if missing_cbush:
+                return {'valid': False, 'error': f"Missing CBUSH columns: {missing_cbush}"}
+           
+            # Check for feature columns
+            feature_cols = [col for col in df.columns if col.startswith(('ACCE_', 'DISP_'))]
+            if len(feature_cols) < 10:
+                return {'valid': False, 'error': f"Insufficient feature columns: {len(feature_cols)} found, expected 72"}
+           
+            # Check data types
+            try:
+                # Convert CBUSH columns to int
+                for col in required_cbush_labels:
+                    df[col] = df[col].astype(int)
+               
+                # Check feature columns are numeric
+                for col in feature_cols[:5]:  # Check first 5 features
+                    pd.to_numeric(df[col], errors='raise')
+                   
+            except ValueError as e:
+                return {'valid': False, 'error': f"Data type validation failed: {str(e)}"}
+           
+            return {'valid': True, 'error': None}
+           
         except Exception as e:
-            error_msg = f"Failed to load parameter preview: {str(e)}"
-            self.log_message(f"❌ {error_msg}")
-            self.param_info_label.config(text=f"❌ Error: {error_msg}", fg='#e74c3c')
-    
-    def load_matrix_file_preview(self, filename):
-        """Load and display feature matrix preview."""
+            return {'valid': False, 'error': f"Validation error: {str(e)}"}
+   
+    def smart_merge_matrices(self, existing_df, new_df):
+        """Smart merge that removes duplicates and combines datasets intelligently."""
         try:
-            self.log_message(f"📊 Loading feature matrix preview: {Path(filename).name}")
-            
-            # Load data
-            self.matrix_data = pd.read_csv(filename)
-            
-            # Populate table
-            self.populate_data_table(self.matrix_tree, self.matrix_data, self.matrix_info_label)
-            
-            self.log_message(f"   ✅ Feature matrix preview loaded: {len(self.matrix_data):,} designs")
-            
+            # Check for overlapping design_ids
+            if 'design_id' in existing_df.columns and 'design_id' in new_df.columns:
+                overlapping_ids = set(existing_df['design_id']) & set(new_df['design_id'])
+                if overlapping_ids:
+                    self.log_message(f"⚠️  Found {len(overlapping_ids)} overlapping design IDs, removing duplicates")
+                    new_df = new_df[~new_df['design_id'].isin(overlapping_ids)]
+           
+            # Merge datasets
+            merged_df = pd.concat([existing_df, new_df], ignore_index=True)
+           
+            # Sort by design_id if available
+            if 'design_id' in merged_df.columns:
+                merged_df = merged_df.sort_values('design_id').reset_index(drop=True)
+           
+            self.log_message(f"📊 Smart merge: {len(existing_df)} + {len(new_df)} = {len(merged_df)} designs")
+            return merged_df
+           
         except Exception as e:
-            error_msg = f"Failed to load feature matrix preview: {str(e)}"
-            self.log_message(f"❌ {error_msg}")
-            self.matrix_info_label.config(text=f"❌ Error: {error_msg}", fg='#e74c3c')
-    
-    def browse_full_matrix(self):
-        """Browse for existing full feature matrix file."""
-        filename = filedialog.askopenfilename(
-            title="Select Full Feature Matrix CSV",
-            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")]
-        )
-        if filename:
-            self.load_full_matrix_preview(filename)
-            self.log_message(f"📁 Full feature matrix selected: {Path(filename).name}")
-    
-    def load_full_matrix_preview(self, filename):
-        """Load and display full feature matrix preview."""
-        try:
-            self.log_message(f"📁 Loading full feature matrix preview: {Path(filename).name}")
-            
-            # Load data
-            self.loaded_full_matrix = pd.read_csv(filename)
-            
-            # Populate table
-            self.populate_data_table(self.load_tree, self.loaded_full_matrix, self.load_info_label)
-            
-            self.log_message(f"   ✅ Full feature matrix preview loaded: {len(self.loaded_full_matrix):,} designs")
-            
-        except Exception as e:
-            error_msg = f"Failed to load full feature matrix preview: {str(e)}"
-            self.log_message(f"❌ {error_msg}")
-            self.load_info_label.config(text=f"❌ Error: {error_msg}", fg='#e74c3c')
-    
-    def browse_param_file(self):
-        """Browse for parameter file."""
-        filename = filedialog.askopenfilename(
-            title="Select Parameter File",
-            filetypes=[("CSV Files", "*.csv"), ("TSV Files", "*.tsv"), ("All Files", "*.*")]
-        )
-        if filename:
-            self.param_file_var.set(filename)
-            self.log_message(f"📋 Parameter file selected: {Path(filename).name}")
-            # Auto-load preview
-            self.load_param_file_preview(filename)
-    
-    def browse_matrix_file(self):
-        """Browse for feature matrix file."""
-        filename = filedialog.askopenfilename(
-            title="Select Feature Matrix File",
-            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")]
-        )
-        if filename:
-            self.matrix_file_var.set(filename)
-            self.log_message(f"📊 Feature matrix selected: {Path(filename).name}")
-            # Auto-load preview
-            self.load_matrix_file_preview(filename)
-    
-    def browse_heeds_dir(self):
-        """Browse for HEEDS directory."""
-        dirname = filedialog.askdirectory(title="Select HEEDS Directory (containing POST_0)")
-        if dirname:
-            self.heeds_dir_var.set(dirname)
-            self.log_message(f"📁 HEEDS directory selected: {Path(dirname).name}")
-    
-    def browse_output_dir(self):
-        """Browse for output directory."""
-        dirname = filedialog.askdirectory(title="Select Output Directory")
-        if dirname:
-            self.output_dir_var.set(dirname)
-            self.log_message(f"💾 Output directory set: {Path(dirname).name}")
-    
-    def validate_inputs(self):
-        """Validate all required inputs."""
-        if not self.param_file_var.get():
-            messagebox.showerror("Missing Input", "Please select a parameter file")
-            return False
-        
-        if not self.matrix_file_var.get():
-            messagebox.showerror("Missing Input", "Please select a feature matrix file")
-            return False
-        
-        if not self.heeds_dir_var.get():
-            messagebox.showerror("Missing Input", "Please select a HEEDS directory")
-            return False
-        
-        # Check if files exist
-        if not Path(self.param_file_var.get()).exists():
-            messagebox.showerror("File Not Found", f"Parameter file not found:\n{self.param_file_var.get()}")
-            return False
-        
-        if not Path(self.matrix_file_var.get()).exists():
-            messagebox.showerror("File Not Found", f"Feature matrix file not found:\n{self.matrix_file_var.get()}")
-            return False
-        
-        if not Path(self.heeds_dir_var.get()).exists():
-            messagebox.showerror("Directory Not Found", f"HEEDS directory not found:\n{self.heeds_dir_var.get()}")
-            return False
-        
-        return True
-    
-    def log_message(self, message):
-        """Log message to the text display."""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        log_entry = f"[{timestamp}] {message}\n"
-        
-        self.log_text.insert(tk.END, log_entry)
-        self.log_text.see(tk.END)
-        self.root.update_idletasks()
-    
-    def clear_log(self):
-        """Clear the log display."""
-        self.log_text.delete('1.0', tk.END)
-        self.log_message("📋 Log cleared")
-    
-    def update_status(self, message):
-        """Update status label."""
-        self.status_label.config(text=message)
-        self.root.update_idletasks()
-    
-    def start_progress(self):
-        """Start progress bar animation."""
-        self.progress_bar.configure(mode='indeterminate')
-        self.progress_bar.start()
-    
-    def stop_progress(self):
-        """Stop progress bar animation."""
-        self.progress_bar.stop()
-        self.progress_bar.configure(mode='determinate')
-        self.progress_var.set(100)
-    
-    def process_single_study(self):
-        """Process a single study in background thread."""
-        if not self.validate_inputs():
+            self.log_message(f"❌ Smart merge failed: {str(e)}")
+            return pd.concat([existing_df, new_df], ignore_index=True)
+   
+    def update_matrix_info_display(self):
+        """Update the matrix information display."""
+        if self.current_data is not None:
+            feature_cols = [col for col in self.current_data.columns if col.startswith(('ACCE_', 'DISP_'))]
+            cbush_cols = [col for col in self.current_data.columns if col.startswith('cbush_') and col.endswith('_loose')]
+           
+            info_text = f"""CURRENT FEATURE MATRIX
+{'='*50}
+
+Matrix Information:
+  Total Designs: {len(self.current_data):,}
+  Total Features: {len(feature_cols)}
+  CBUSH Labels: {len(cbush_cols)}
+  Memory Usage: {self.current_data.memory_usage(deep=True).sum() / 1024 / 1024:.1f} MB
+
+Study Composition:"""
+           
+            if 'study_type' in self.current_data.columns:
+                study_counts = self.current_data['study_type'].value_counts()
+                for study_type, count in study_counts.items():
+                    percentage = (count / len(self.current_data)) * 100
+                    info_text += f"\n  {study_type}: {count:,} designs ({percentage:.1f}%)"
+           
+            info_text += f"\n\nCBUSH Label Distribution:"
+            for cbush_num in range(2, 11):
+                col_name = f'cbush_{cbush_num}_loose'
+                if col_name in self.current_data.columns:
+                    count = self.current_data[col_name].sum()
+                    percentage = (count / len(self.current_data)) * 100
+                    info_text += f"\n  CBUSH {cbush_num}: {count:,} loose ({percentage:.1f}%)"
+           
+            info_text += f"\n\n✅ Ready for ML Trinity training!"
+           
+            self.matrix_info_text.delete('1.0', tk.END)
+            self.matrix_info_text.insert('1.0', info_text)
+   
+    # ⭐ ENHANCED: ML Trinity Training
+    def train_ml_trinity(self):
+        """Train the ML Trinity (Random Forest + XGBoost + Ensemble)."""
+        if self.current_data is None:
+            messagebox.showerror("Error", "No matrix available. Create or load a matrix first.")
             return
+       
+        if not SKLEARN_AVAILABLE:
+            messagebox.showerror("Error", "scikit-learn not available - cannot train models")
+            return
+       
+        # Start training in background
+        self.training_progress_bar.configure(mode='indeterminate')
+        self.training_progress_bar.start()
+        self.training_status_label.config(text="Training ML Trinity...")
+       
+        self.training_thread = threading.Thread(target=self._train_ml_trinity_thread)
+        self.training_thread.daemon = True
+        self.training_thread.start()
+   
+    def _train_ml_trinity_thread(self):
+        """Train ML Trinity in background thread."""
+        try:
+            self.log_message("🚀 Starting ML Trinity training...")
+           
+            # Train all models
+            training_results = self.ml_pipeline.train_ml_trinity(self.current_data)
+           
+            # Update UI on main thread
+            self.root.after(0, self._training_complete, training_results)
+           
+        except Exception as e:
+            error_msg = f"Training error: {str(e)}"
+            self.root.after(0, self._training_failed, error_msg)
+   
+    def _training_complete(self, training_results):
+        """Handle training completion."""
+        self.training_progress_bar.stop()
+        self.training_progress_bar.configure(mode='determinate')
+        self.training_progress_var.set(100)
+       
+        # Get model comparison
+        comparison_df = self.ml_pipeline.get_model_comparison()
+       
+        if comparison_df is not None:
+            # Find best model
+            best_model = None
+            best_score = 0
+            for _, row in comparison_df.iterrows():
+                score = float(row['Deployment_Score'].replace('/100', ''))
+                if score > best_score:
+                    best_score = score
+                    best_model = row['Model']
+           
+            self.training_status_label.config(
+                text=f"✅ Training Complete - Best: {best_model} ({best_score:.1f}/100)"
+            )
+           
+            # Display results
+            results_text = f"""🚀 ML TRINITY TRAINING COMPLETE
+{'='*60}
+
+"""
+            results_text += comparison_df.to_string(index=False)
+           
+            results_text += f"""
+
+🎯 DEPLOYMENT ASSESSMENT:
+Best Model: {best_model}
+Deployment Score: {best_score:.1f}/100
+
+"""
+            if best_score >= 70:
+                results_text += "🚀 STATUS: READY FOR SPACECRAFT DEPLOYMENT\n"
+                results_text += "🌟 Excellent performance for safety-critical systems!"
+            elif best_score >= 50:
+                results_text += "🔧 STATUS: GOOD PERFORMANCE - DEPLOYMENT READY\n"
+                results_text += "✅ Meets spacecraft safety requirements"
+            else:
+                results_text += "⚠️  STATUS: NEEDS IMPROVEMENT\n"
+                results_text += "💡 Consider feature engineering or more data"
+           
+            self.ml_results_text.delete('1.0', tk.END)
+            self.ml_results_text.insert('1.0', results_text)
+           
+            self.log_message(f"✅ ML Trinity training completed - Best: {best_model} ({best_score:.1f}/100)")
+           
+            # Show completion popup
+            messagebox.showinfo("Training Complete",
+                               f"✅ ML Trinity training completed!\n\n"
+                               f"Best Model: {best_model}\n"
+                               f"Deployment Score: {best_score:.1f}/100\n"
+                               f"Status: {'DEPLOYMENT READY' if best_score >= 50 else 'NEEDS IMPROVEMENT'}")
+        else:
+            self.training_status_label.config(text="❌ Training failed")
+            messagebox.showerror("Training Failed", "No models were successfully trained")
+   
+    def _training_failed(self, error_msg):
+        """Handle training failure."""
+        self.training_progress_bar.stop()
+        self.training_status_label.config(text="❌ Training failed")
+       
+        error_text = f"""❌ ML TRINITY TRAINING FAILED
+{'='*50}
+
+Error: {error_msg}
+
+Common causes:
+1. Insufficient memory
+2. Data quality issues  
+3. Missing dependencies
+
+Solutions:
+1. Check data quality in matrix
+2. Ensure scikit-learn and xgboost are installed
+3. Try with smaller dataset
+4. Check system memory
+"""
+       
+        self.ml_results_text.delete('1.0', tk.END)
+        self.ml_results_text.insert('1.0', error_text)
+       
+        self.log_message(f"❌ ML Trinity training failed: {error_msg}")
+        messagebox.showerror("Training Failed", f"Training failed:\n\n{error_msg}")
+   
+    def compare_models(self):
+        """Display model comparison."""
+        if not self.ml_pipeline.is_trained:
+            messagebox.showwarning("Warning", "No models trained yet. Train ML Trinity first.")
+            return
+       
+        comparison_df = self.ml_pipeline.get_model_comparison()
+        if comparison_df is not None:
+            # Display in popup window
+            comparison_window = tk.Toplevel(self.root)
+            comparison_window.title("Model Performance Comparison")
+            comparison_window.geometry("800x400")
+           
+            # Create table
+            frame = tk.Frame(comparison_window)
+            frame.pack(fill='both', expand=True, padx=10, pady=10)
+           
+            columns = list(comparison_df.columns)
+            tree = ttk.Treeview(frame, columns=columns, show='headings')
+           
+            for col in columns:
+                tree.heading(col, text=col)
+                tree.column(col, width=100)
+           
+            for _, row in comparison_df.iterrows():
+                tree.insert('', 'end', values=list(row))
+           
+            tree.pack(fill='both', expand=True)
+        else:
+            messagebox.showinfo("Info", "No comparison data available")
+   
+    # Event handlers (keeping existing ones and adding new ones)
+    def browse_heeds_directory(self):
+        """Browse for HEEDS output directory."""
+        directory = filedialog.askdirectory(title="Select HEEDS Output Directory (containing POST_0)")
+        if directory:
+            self.heeds_path_var.set(directory)
+            self.log_message(f"📁 Selected HEEDS directory: {directory}")
+   
+    def validate_directory(self):
+        """Validate the selected HEEDS directory."""
+        directory = self.heeds_path_var.get().strip()
+        if not directory:
+            messagebox.showerror("Error", "Please select a HEEDS directory first")
+            return
+       
+        try:
+            self.processor.set_heeds_directory(directory)
+            self.processor.validate_heeds_directory()
+           
+            self.validation_status.config(text="✅ Directory validated", fg='#27ae60')
+            self.log_message(f"✅ HEEDS directory validated: {directory}")
+            messagebox.showinfo("Success", "HEEDS directory validated successfully!")
+           
+        except Exception as e:
+            self.validation_status.config(text="❌ Validation failed", fg='#e74c3c')
+            self.log_message(f"❌ Directory validation failed: {str(e)}")
+            messagebox.showerror("Validation Error", str(e))
+   
+    def scan_designs(self):
+        """Scan for available designs in background thread."""
+        if not self.processor.heeds_directory:
+            messagebox.showerror("Error", "Please set and validate HEEDS directory first")
+            return
+       
+        self.scan_progress_bar.configure(mode='indeterminate')
+        self.scan_progress_bar.start()
+        self.scan_status_label.config(text="Scanning designs...")
+       
+        self.scanning_thread = threading.Thread(target=self._scan_designs_thread)
+        self.scanning_thread.daemon = True
+        self.scanning_thread.start()
+   
+    def _scan_designs_thread(self):
+        """Scan designs in background thread with MANUAL RANGE support."""
+        try:
+            self.log_message("🔍 Starting design scan...")
+           
+            scan_results = self.processor.scan_available_designs()
+            available_designs = scan_results['available_designs']
+            
+            # ⭐ NEW: Apply manual range if enabled
+            if self.use_manual_range.get():
+                try:
+                    start_design = int(self.manual_start.get())
+                    end_design = int(self.manual_end.get())
+                    study_name = self.manual_study_name.get().strip()
+                    
+                    if not study_name:
+                        study_name = f"Manual_Study_{start_design}_{end_design}"
+                    
+                    self.log_message(f"🎯 Using manual range: {start_design}-{end_design}, Study: {study_name}")
+                    
+                    # Validate range
+                    available_numbers = list(available_designs.keys())
+                    if not available_numbers:
+                        raise ValueError("No available designs found")
+                    
+                    actual_start = max(start_design, min(available_numbers))
+                    actual_end = min(end_design, max(available_numbers))
+                    
+                    # Filter to manual range
+                    filtered_designs = {k: v for k, v in available_designs.items() 
+                                      if actual_start <= k <= actual_end}
+                    
+                    if not filtered_designs:
+                        raise ValueError(f"No designs found in range {start_design}-{end_design}")
+                    
+                    # Create manual study info
+                    study_info = {
+                        'name': study_name,
+                        'type': 'manual_range',
+                        'description': f'Manual Range: {actual_start}-{actual_end} ({len(filtered_designs)} designs)',
+                        'design_numbers': sorted(filtered_designs.keys()),
+                        'total_designs': len(filtered_designs),
+                        'design_range': (actual_start, actual_end),
+                        'user_defined': True,
+                        'manual_range': True,
+                        'specified_range': (start_design, end_design),
+                        'actual_range': (actual_start, actual_end)
+                    }
+                    
+                    self.log_message(f"✅ Manual range applied: {len(filtered_designs)} designs selected")
+                    
+                except Exception as e:
+                    # If manual range fails, fall back to auto-detection but log the error
+                    self.log_message(f"❌ Manual range failed: {str(e)}, falling back to auto-detection")
+                    study_info = self.processor.auto_detect_study_type(available_designs)
+            else:
+                # Use existing auto-detection
+                study_info = self.processor.auto_detect_study_type(available_designs)
+           
+            self.root.after(0, self._scan_complete, scan_results, study_info)
+           
+        except Exception as e:
+            error_msg = f"Scan error: {str(e)}"
+            self.root.after(0, self._scan_failed, error_msg)
+   
+    def _scan_complete(self, scan_results, study_info):
+        """Handle scan completion on main thread."""
+        self.scan_progress_bar.stop()
+        self.scan_status_label.config(text="Scan completed")
+       
+        self.scan_results = scan_results
+        self.study_info = study_info
+       
+        # Update results tree
+        self.results_tree.delete(*self.results_tree.get_children())
+       
+        # Add scan results
+        self.results_tree.insert('', 'end', values=('Total Designs Found', f"{scan_results['total_scanned']:,}", 'Total Design directories found'))
+        self.results_tree.insert('', 'end', values=('Available Designs', f"{len(scan_results['available_designs']):,}", 'Designs with complete data files'))
+        self.results_tree.insert('', 'end', values=('Failed Designs', f"{len(scan_results['failed_designs']):,}", 'Designs with missing/corrupted files'))
+        self.results_tree.insert('', 'end', values=('Success Rate', f"{scan_results['success_rate']:.1%}", 'Percentage of successful designs'))
+       
+        # Add study detection results
+        self.results_tree.insert('', 'end', values=('', '', ''))  # Separator
         
-        # Start processing in background
-        self.start_progress()
-        self.update_status("Processing single study...")
-        self.log_message("🚀 Starting single study processing...")
+        # ⭐ NEW: Show manual range information if used
+        if study_info.get('manual_range', False):
+            self.results_tree.insert('', 'end', values=('Study Mode', 'Manual Range', 'User-defined study configuration'))
+            self.results_tree.insert('', 'end', values=('Study Name', study_info.get('name', 'Unknown'), 'User-provided study name'))
+            self.results_tree.insert('', 'end', values=('Specified Range', f"{study_info.get('specified_range', (0,0))[0]}-{study_info.get('specified_range', (0,0))[1]}", 'User-specified design range'))
+            self.results_tree.insert('', 'end', values=('Actual Range', f"{study_info.get('actual_range', (0,0))[0]}-{study_info.get('actual_range', (0,0))[1]}", 'Actual range after filtering'))
+            self.results_tree.insert('', 'end', values=('Selected Designs', f"{study_info['total_designs']:,}", 'Designs in the manual range'))
+        else:
+            self.results_tree.insert('', 'end', values=('Study Mode', 'Auto-Detection', 'Automatic study type detection'))
+            self.results_tree.insert('', 'end', values=('Study Type', study_info.get('type', 'unknown'), 'Auto-detected study classification'))
+            self.results_tree.insert('', 'end', values=('Expected Format', study_info.get('expected_format', 'Unknown'), 'Expected study format'))
+            self.results_tree.insert('', 'end', values=('CBUSH Count', str(study_info.get('likely_cbush_count', 'Unknown')), 'Expected number of varied CBUSHes'))
         
-        self.processing_thread = threading.Thread(target=self._process_single_study_thread)
+        self.results_tree.insert('', 'end', values=('Study Description', study_info.get('description', 'Unknown'), 'Detailed study description'))
+        self.results_tree.insert('', 'end', values=('Design Range', f"{study_info['design_range'][0]}-{study_info['design_range'][1]}", 'Range of design numbers'))
+       
+        self.log_message(f"✅ Scan completed: {len(scan_results['available_designs']):,} designs available")
+        self.log_message(f"📊 Study detected: {study_info.get('description', 'Unknown Study')}")
+       
+        # Create appropriate message for popup
+        if study_info.get('manual_range', False):
+            popup_message = (f"Scan completed with manual range!\n\n"
+                           f"Study: {study_info.get('name', 'Unknown')}\n"
+                           f"Selected: {study_info['total_designs']:,} designs\n"
+                           f"Range: {study_info.get('actual_range', (0,0))[0]}-{study_info.get('actual_range', (0,0))[1]}")
+        else:
+            popup_message = (f"Scan completed successfully!\n\n"
+                           f"Available: {len(scan_results['available_designs']):,} designs\n"
+                           f"Failed: {len(scan_results['failed_designs']):,} designs\n"
+                           f"Study Type: {study_info.get('description', 'Unknown')}")
+        
+        messagebox.showinfo("Scan Complete", popup_message)
+   
+    def _scan_failed(self, error_msg):
+        """Handle scan failure on main thread."""
+        self.scan_progress_bar.stop()
+        self.scan_status_label.config(text="Scan failed")
+        self.log_message(f"❌ {error_msg}")
+        messagebox.showerror("Scan Failed", error_msg)
+   
+    def process_study(self):
+        """Process the detected study."""
+        if not self.study_info:
+            messagebox.showerror("Error", "Please scan for designs first")
+            return
+       
+        if not FEATURE_EXTRACTOR_AVAILABLE:
+            messagebox.showerror("Error", "Feature extractor not available")
+            return
+       
+        self.process_progress_bar.configure(mode='indeterminate')
+        self.process_progress_bar.start()
+        self.process_status_label.config(text="Processing study...")
+       
+        self.processing_thread = threading.Thread(target=self._process_study_thread)
         self.processing_thread.daemon = True
         self.processing_thread.start()
-    
-    def _process_single_study_thread(self):
-        """Process single study in background thread."""
+   
+    def _process_study_thread(self):
+        """Process study in background thread."""
         try:
-            # Initialize editor with GUI log callback
-            self.editor = FeatureMatrixEditor(
-                output_dir=self.output_dir_var.get(),
-                verbose=False  # We'll handle logging through GUI
-            )
-            
-            # Override the editor's log method to send to GUI
-            original_log = self.editor.log
-            def gui_log(message):
-                self.root.after(0, lambda: self.log_message(message))
-            self.editor.log = gui_log
-            
-            # Get user-defined threshold
-            user_threshold = self.get_user_threshold()
-            self.root.after(0, lambda: self.log_message(f"🎯 Using threshold: {user_threshold:.0e}"))
-            
-            # Process the study
-            result = self.editor.process_single_study(
-                param_file=self.param_file_var.get(),
-                matrix_file=self.matrix_file_var.get(),
-                heeds_directory=self.heeds_dir_var.get(),
-                study_name=self.study_name_var.get() or None,
-                user_threshold=user_threshold
-            )
-            
-            # Update GUI on main thread
-            self.root.after(0, self._process_single_complete, result)
-            
+            def progress_callback(current, total, message):
+                progress = (current / total) * 100 if total > 0 else 0
+                self.root.after(0, lambda: self.process_progress_var.set(progress))
+                self.root.after(0, lambda: self.process_status_label.config(text=f"{message} ({current}/{total})"))
+           
+            result = self.processor.process_study_batch(self.study_info, progress_callback)
+            self.root.after(0, self._process_complete, result)
+           
         except Exception as e:
             error_msg = f"Processing error: {str(e)}"
             self.root.after(0, self._process_failed, error_msg)
-    
-    def _process_single_complete(self, result):
-        """Handle single study processing completion."""
-        self.stop_progress()
-        
-        if result:
-            self.update_status("✅ Single study processing complete!")
-            
-            # Load and display the combined data
-            try:
-                output_file = result['output_file']
-                self.combined_data = pd.read_csv(output_file)
-                
-                # Add cbush_list and cbush_count columns
-                self.combined_data = self.add_cbush_summary_columns(self.combined_data)
-                
-                # Save updated data
-                self.combined_data.to_csv(output_file, index=False)
-                
-                # Display in preview tab
-                self.populate_data_table(self.combined_tree, self.combined_data, self.combined_info_label)
-                
-                # Switch to the combined tab to show results
-                self.preview_notebook.select(self.combined_tab)
-                
-                self.log_message(f"   📊 Combined data preview updated: {len(self.combined_data):,} designs")
-                
-            except Exception as e:
-                self.log_message(f"⚠️ Could not load combined data preview: {str(e)}")
-            
-            # Validate if requested
-            if self.validate_var.get():
-                self.log_message("🔍 Validating dataset...")
-                validation_result = self.editor.validate_enhanced_dataset(result['output_file'])
-                
-                if validation_result:
-                    quality_score = validation_result['data_quality_score']
-                    self.log_message(f"📊 Data quality score: {quality_score:.1%}")
-                    
-                    if quality_score >= 0.95:
-                        status_msg = f"✅ EXCELLENT quality - ML ready! ({quality_score:.1%})"
-                    elif quality_score >= 0.85:
-                        status_msg = f"👍 GOOD quality - ML suitable ({quality_score:.1%})"
-                    else:
-                        status_msg = f"⚠️  Quality issues detected ({quality_score:.1%})"
-                    
-                    self.update_status(status_msg)
-            
-            # Generate report
-            self.editor.generate_comprehensive_report()
-            
-            # Show success message
-            output_file = result['output_file']
-            threshold_used = result.get('user_threshold', 'N/A')
-            messagebox.showinfo("Success!", 
-                               f"✅ Study processed successfully!\n\n"
-                               f"Output: {Path(output_file).name}\n"
-                               f"Designs: {result['final_dataset_shape'][0]:,}\n"
-                               f"Columns: {result['final_dataset_shape'][1]}\n"
-                               f"Alignment: {result['alignment_stats']['alignment_rate']:.1%}\n"
-                               f"Threshold: {threshold_used}")
+   
+    def _process_complete(self, result):
+        """Handle processing completion on main thread."""
+        self.process_progress_bar.stop()
+        self.process_progress_bar.configure(mode='determinate')
+        self.process_progress_var.set(100)
+        self.process_status_label.config(text="Processing completed")
+       
+        if result is not None:
+            # Update stats display
+            self.stats_text.delete('1.0', tk.END)
+           
+            stats_text = f"""STUDY PROCESSING COMPLETE
+{'='*50}
+
+Study Information:
+  Name: {self.study_info.get('name', 'Unknown')}
+  Type: {self.study_info.get('description', 'Unknown')}
+  Total Designs: {len(result):,}
+
+Processing Results:
+  Features Extracted: {len([col for col in result.columns if col.startswith(('ACCE_', 'DISP_'))])}
+  Memory Usage: {result.memory_usage(deep=True).sum() / 1024 / 1024:.1f} MB
+ 
+Feature Categories:
+"""
+           
+            # Add feature breakdown
+            feature_counts = {}
+            for col in result.columns:
+                if col.startswith('ACCE_T1_PSD'):
+                    feature_counts['Modal (PSD)'] = feature_counts.get('Modal (PSD)', 0) + 1
+                elif col.startswith('ACCE_T1_Area'):
+                    feature_counts['Energy (Area)'] = feature_counts.get('Energy (Area)', 0) + 1
+                elif col.startswith('DISP_'):
+                    feature_counts['Displacement'] = feature_counts.get('Displacement', 0) + 1
+           
+            for category, count in feature_counts.items():
+                stats_text += f"  {category}: {count} features\n"
+           
+            stats_text += f"\n✅ Ready for matrix creation and ML training!"
+           
+            self.stats_text.insert('1.0', stats_text)
+           
+            self.log_message(f"✅ Study processing completed: {len(result):,} designs processed")
+            messagebox.showinfo("Processing Complete",
+                               f"Study processing completed successfully!\n\n"
+                               f"Processed: {len(result):,} designs\n"
+                               f"Features: {len([col for col in result.columns if col.startswith(('ACCE_', 'DISP_'))])}\n"
+                               f"Ready for matrix creation!")
         else:
-            self.update_status("❌ Processing failed")
-            messagebox.showerror("Processing Failed", "Study processing failed. Check the log for details.")
-    
-    def add_cbush_summary_columns(self, df):
-        """Add cbush_list and cbush_count summary columns."""
-        try:
-            def get_loose_cbushes(row):
-                loose_list = []
-                for cbush_num in range(2, 11):
-                    if f'cbush_{cbush_num}_loose' in df.columns and row[f'cbush_{cbush_num}_loose'] == 1:
-                        loose_list.append(cbush_num)
-                
-                # Format to match original data: "[2 3 4 5 6 7 8 9 10]"
-                if loose_list:
-                    return str(loose_list).replace(',', '')
-                else:
-                    return "[]"
-            
-            # Add cbush_list column
-            df['cbush_list'] = df.apply(get_loose_cbushes, axis=1)
-            
-            # Add cbush_count column
-            cbush_cols = [f'cbush_{i}_loose' for i in range(2, 11) if f'cbush_{i}_loose' in df.columns]
-            df['cbush_count'] = df[cbush_cols].sum(axis=1)
-            
-            self.log_message(f"   ✅ Added cbush_list and cbush_count columns")
-            
-            return df
-            
-        except Exception as e:
-            self.log_message(f"⚠️ Warning: Could not add cbush summary columns: {str(e)}")
-            return df
-    
+            self.log_message("❌ Study processing failed")
+            messagebox.showerror("Processing Failed", "Study processing failed")
+   
     def _process_failed(self, error_msg):
-        """Handle processing failure."""
-        self.stop_progress()
-        self.update_status("❌ Processing failed")
+        """Handle processing failure on main thread."""
+        self.process_progress_bar.stop()
+        self.process_status_label.config(text="Processing failed")
         self.log_message(f"❌ {error_msg}")
-        messagebox.showerror("Processing Failed", f"An error occurred:\n\n{error_msg}")
-    
-    def _combine_studies_thread(self, study_files):
-        """Combine studies in background thread."""
+        messagebox.showerror("Processing Failed", error_msg)
+   
+    def pause_processing(self):
+        """Pause processing."""
+        self.processor.pause_processing()
+        self.log_message("⏸️ Processing paused")
+   
+    def stop_processing(self):
+        """Stop processing."""
+        self.processor.stop_processing()
+        self.log_message("⏹️ Processing stopped")
+   
+    def create_matrix(self):
+        """Create master matrix."""
+        if not self.processor.processed_data:
+            messagebox.showerror("Error", "No processed data available. Process a study first.")
+            return
+       
         try:
-            # Initialize editor if not already done
-            if not self.editor:
-                self.editor = FeatureMatrixEditor(
-                    output_dir=self.output_dir_var.get(),
-                    verbose=False
-                )
-                
-                # Override logging
-                def gui_log(message):
-                    self.root.after(0, lambda: self.log_message(message))
-                self.editor.log = gui_log
-            
-            # Combine studies
-            combination_result = self.editor.combine_multiple_studies(study_files=study_files)
-            
-            # Update GUI on main thread
-            self.root.after(0, self._combine_complete, combination_result)
-            
+            strategy = self.matrix_strategy.get()
+            self.log_message(f"🔨 Creating master matrix using {strategy} strategy...")
+           
+            matrix_from_studies = self.processor.create_master_matrix(strategy=strategy)
+           
+            if matrix_from_studies is not None:
+                # If we have loaded data, offer to combine
+                if self.loaded_data is not None:
+                    result = messagebox.askyesnocancel(
+                        "Combine Matrices",
+                        "You have both processed study data and loaded CSV data.\n\n"
+                        "Yes: Combine both datasets\n"
+                        "No: Use only processed data\n"
+                        "Cancel: Abort operation"
+                    )
+                   
+                    if result is None:  # Cancel
+                        return
+                    elif result:  # Yes - combine
+                        self.current_data = self.smart_merge_matrices(matrix_from_studies, self.loaded_data)
+                        self.log_message(f"📊 Combined datasets: {len(self.current_data):,} total designs")
+                    else:  # No - use only processed
+                        self.current_data = matrix_from_studies
+                else:
+                    self.current_data = matrix_from_studies
+               
+                # Update display
+                self.update_matrix_info_display()
+               
+                self.log_message(f"✅ Master matrix created: {len(self.current_data):,} designs")
+                messagebox.showinfo("Success", f"Master matrix created successfully!\n{len(self.current_data):,} designs")
+            else:
+                messagebox.showerror("Error", "Failed to create master matrix")
+               
         except Exception as e:
-            error_msg = f"Combination error: {str(e)}"
-            self.root.after(0, self._process_failed, error_msg)
-    
-    def _combine_complete(self, result):
-        """Handle study combination completion."""
-        self.stop_progress()
-        
-        if result:
-            self.update_status("✅ Study combination complete!")
-            
-            # Load and display the combined data
+            error_msg = f"Matrix creation failed: {str(e)}"
+            self.log_message(f"❌ {error_msg}")
+            messagebox.showerror("Error", error_msg)
+   
+    def save_matrix(self):
+        """Save master matrix to CSV."""
+        if self.current_data is None:
+            messagebox.showerror("Error", "No matrix available. Create or load matrix first.")
+            return
+       
+        filename = filedialog.asksaveasfilename(
+            title="Save Master Matrix",
+            defaultextension=".csv",
+            filetypes=[("CSV Files", "*.csv")],
+            initialfile=f"enhanced_matrix_{len(self.current_data)}_designs.csv"
+        )
+       
+        if filename:
             try:
-                output_file = result['output_file']
-                self.combined_data = pd.read_csv(output_file)
-                
-                # Add cbush_list and cbush_count columns if not present
-                if 'cbush_list' not in self.combined_data.columns:
-                    self.combined_data = self.add_cbush_summary_columns(self.combined_data)
-                    self.combined_data.to_csv(output_file, index=False)
-                
-                # Display in preview tab
-                self.populate_data_table(self.combined_tree, self.combined_data, self.combined_info_label)
-                
-                # Switch to the combined tab to show results
-                self.preview_notebook.select(self.combined_tab)
-                
-                self.log_message(f"   📊 Combined data preview updated: {len(self.combined_data):,} designs")
-                
+                print(f"💾 Saving enhanced matrix to: {filename}")
+                self.current_data.to_csv(filename, index=False)
+                self.log_message(f"💾 Enhanced matrix saved: {filename}")
+                messagebox.showinfo("Success", f"Matrix saved successfully!\n{filename}")
             except Exception as e:
-                self.log_message(f"⚠️ Could not load combined data preview: {str(e)}")
-            
-            # Validate if requested
-            if self.validate_var.get():
-                self.log_message("🔍 Validating combined dataset...")
-                validation_result = self.editor.validate_enhanced_dataset(result['output_file'])
-                
-                if validation_result:
-                    quality_score = validation_result['data_quality_score']
-                    self.log_message(f"📊 Combined data quality: {quality_score:.1%}")
-            
-            # Show success message
-            output_file = result['output_file']
-            stats = result['combination_stats']
-            
-            messagebox.showinfo("Combination Success!", 
-                               f"✅ Studies combined successfully!\n\n"
-                               f"Output: {Path(output_file).name}\n"
-                               f"Total designs: {stats['total_combined_designs']:,}\n"
-                               f"Studies combined: {stats['total_studies']}\n"
-                               f"Global ML IDs: {stats['global_ml_id_range'][0]}-{stats['global_ml_id_range'][1]}")
-        else:
-            self.update_status("❌ Combination failed")
-            messagebox.showerror("Combination Failed", "Study combination failed. Check the log for details.")
-    
-    def clear_all_inputs(self):
-        """Clear all input fields and data."""
-        # Clear file paths
-        self.param_file_var.set("")
-        self.matrix_file_var.set("")
-        self.heeds_dir_var.set("")
-        self.study_name_var.set("")
-        self.study1_file_var.set("")
-        self.study2_file_var.set("")
-        
-        # Clear data
-        self.param_data = None
-        self.matrix_data = None
-        self.combined_data = None
-        self.loaded_full_matrix = None
-        if hasattr(self, 'scaled_data'):
-            delattr(self, 'scaled_data')
-        
-        # Clear all preview tables
-        for tree in [self.param_tree, self.matrix_tree, self.combined_tree, self.load_tree]:
-            for item in tree.get_children():
-                tree.delete(item)
-        
-        # Reset info labels
-        self.param_info_label.config(text="No parameter file loaded", fg='#7f8c8d')
-        self.matrix_info_label.config(text="No feature matrix loaded", fg='#7f8c8d')
-        self.combined_info_label.config(text="No combined data available - process a study first", fg='#7f8c8d')
-        self.load_info_label.config(text="No full feature matrix loaded", fg='#7f8c8d')
-        
-        # Clear scaling results
-        if hasattr(self, 'before_scaling_text'):
-            self.before_scaling_text.delete('1.0', tk.END)
-            self.after_scaling_text.delete('1.0', tk.END)
-        
-        # Clear correlation results
-        if hasattr(self, 'correlation_text'):
-            self.correlation_text.delete('1.0', tk.END)
-            self.ai_suggestions_text.delete('1.0', tk.END)
-        
-        # Reset status
-        self.update_status("Ready")
-        
-        self.log_message("🧹 All inputs and data cleared")
-    
-    def browse_study1_file(self):
-        """Browse for first study file."""
-        filename = filedialog.askopenfilename(
-            title="Select First Study File",
-            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")]
-        )
-        if filename:
-            self.study1_file_var.set(filename)
-            self.log_message(f"📁 Study 1 selected: {Path(filename).name}")
-    
-    def browse_study2_file(self):
-        """Browse for second study file."""
-        filename = filedialog.askopenfilename(
-            title="Select Second Study File",
-            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")]
-        )
-        if filename:
-            self.study2_file_var.set(filename)
-            self.log_message(f"📁 Study 2 selected: {Path(filename).name}")
-    
-    def combine_two_studies(self):
-        """Combine two selected study files."""
-        study1_file = self.study1_file_var.get()
-        study2_file = self.study2_file_var.get()
-        
-        if not study1_file:
-            messagebox.showwarning("Missing File", "Please select Study File 1")
+                error_msg = f"Failed to save matrix: {str(e)}"
+                self.log_message(f"❌ {error_msg}")
+                messagebox.showerror("Error", error_msg)
+   
+    def calculate_scores(self):
+        """Calculate comprehensive scores."""
+        if not SCORING_SYSTEM_AVAILABLE:
+            messagebox.showerror("Error", "Scoring system not available")
             return
-        
-        if not study2_file:
-            messagebox.showwarning("Missing File", "Please select Study File 2")
+       
+        if not self.ml_pipeline.is_trained:
+            messagebox.showerror("Error", "No trained models available")
             return
-        
-        if not Path(study1_file).exists():
-            messagebox.showerror("File Not Found", f"Study File 1 not found:\n{study1_file}")
+       
+        self.log_message("📈 Calculating comprehensive scores...")
+       
+        # This would implement comprehensive scoring
+        self.scoring_results_text.delete('1.0', tk.END)
+        self.scoring_results_text.insert('1.0', "Comprehensive scoring functionality available but not implemented in this demo.\nScoring system is ready for integration.")
+   
+    def export_matrix(self):
+        """Export matrix."""
+        self.save_matrix()
+   
+    def export_results(self):
+        """Export ML results."""
+        if not self.ml_pipeline.is_trained:
+            messagebox.showwarning("Warning", "No models trained yet")
             return
-        
-        if not Path(study2_file).exists():
-            messagebox.showerror("File Not Found", f"Study File 2 not found:\n{study2_file}")
-            return
-        
-        # Start combination process
-        self.start_progress()
-        self.update_status("Combining studies...")
-        self.log_message(f"🔗 Combining two study files...")
-        
-        study_files = [study1_file, study2_file]
-        self.processing_thread = threading.Thread(target=self._combine_studies_thread, args=(study_files,))
-        self.processing_thread.daemon = True
-        self.processing_thread.start()
-    
-    def create_heatmap_tab(self, parent):
-        """Create heatmap visualization tab."""
-        # Info frame
-        info_frame = tk.Frame(parent)
-        info_frame.pack(fill='x', padx=10, pady=10)
-        
-        tk.Label(info_frame, text="🔥 Correlation Heatmap Visualization", 
-                font=('Arial', 14, 'bold')).pack(anchor='w')
-        tk.Label(info_frame, text="Generate heatmaps based on correlation matrix selections", 
-                font=('Arial', 10), fg='#666666').pack(anchor='w')
-        
-        # Controls frame
-        controls_frame = ttk.LabelFrame(parent, text="Heatmap Settings")
-        controls_frame.pack(fill='x', padx=10, pady=10)
-        
-        # Settings
-        settings_frame = tk.Frame(controls_frame)
-        settings_frame.pack(fill='x', padx=10, pady=5)
-        
-        # Colormap selection
-        colormap_frame = tk.Frame(settings_frame)
-        colormap_frame.pack(fill='x', pady=5)
-        tk.Label(colormap_frame, text="Color Scheme:", font=('Arial', 10, 'bold')).pack(side='left')
-        self.heatmap_colormap_var = tk.StringVar(value="RdYlBu_r")
-        colormap_combo = ttk.Combobox(colormap_frame, textvariable=self.heatmap_colormap_var,
-                                     values=["RdYlBu_r", "coolwarm", "viridis", "plasma", "inferno", "magma"],
-                                     width=15)
-        colormap_combo.pack(side='left', padx=10)
-        
-        # Size settings
-        size_frame = tk.Frame(settings_frame)
-        size_frame.pack(fill='x', pady=5)
-        tk.Label(size_frame, text="Figure Size:", font=('Arial', 10, 'bold')).pack(side='left')
-        self.heatmap_width_var = tk.StringVar(value="12")
-        self.heatmap_height_var = tk.StringVar(value="8")
-        tk.Label(size_frame, text="Width:").pack(side='left', padx=(10,2))
-        tk.Entry(size_frame, textvariable=self.heatmap_width_var, width=5).pack(side='left')
-        tk.Label(size_frame, text="Height:").pack(side='left', padx=(10,2))
-        tk.Entry(size_frame, textvariable=self.heatmap_height_var, width=5).pack(side='left')
-        
-        # Options
-        options_frame = tk.Frame(settings_frame)
-        options_frame.pack(fill='x', pady=5)
-        self.heatmap_annot_var = tk.BooleanVar(value=True)
-        self.heatmap_cbar_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(options_frame, text="Show values", variable=self.heatmap_annot_var).pack(side='left')
-        tk.Checkbutton(options_frame, text="Show colorbar", variable=self.heatmap_cbar_var).pack(side='left', padx=20)
-        
-        # Generate button
-        button_frame = tk.Frame(controls_frame)
-        button_frame.pack(fill='x', padx=10, pady=10)
-        
-        tk.Button(button_frame, text="🔥 Generate Heatmap", command=self.generate_heatmap,
-                 bg='#e74c3c', fg='white', font=('Arial', 11, 'bold'), height=1, width=20).pack(side='left', padx=5)
-        
-        tk.Button(button_frame, text="💾 Save Heatmap", command=self.save_heatmap,
-                 bg='#27ae60', fg='white', font=('Arial', 11, 'bold'), height=1, width=15).pack(side='left', padx=5)
-        
-        # Results frame
-        results_frame = ttk.LabelFrame(parent, text="📊 Heatmap Display")
-        results_frame.pack(fill='both', expand=True, padx=10, pady=10)
-        
-        # Placeholder for matplotlib figure
-        self.heatmap_info_label = tk.Label(results_frame, 
-                                          text="🔥 Generate a correlation heatmap using the settings above.\n\nNote: Requires matplotlib. Install with: pip install matplotlib seaborn", 
-                                          font=('Arial', 12), fg='#666666', justify='center')
-        self.heatmap_info_label.pack(expand=True)
-        
-        self.current_heatmap_data = None
-    
-    def generate_heatmap(self):
-        """Generate correlation heatmap visualization."""
-        try:
-            import matplotlib.pyplot as plt
-            import seaborn as sns
-            import numpy as np
-            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-            
-            # Use scaled data if available, otherwise original
-            data = self.scaled_data if hasattr(self, 'scaled_data') else self.combined_data
-            
-            if data is None:
-                messagebox.showwarning("No Data", "Please process a study first")
-                return
-            
-            # Get feature selection from correlation tab
-            columns_to_analyze = []
-            
-            if hasattr(self, 'corr_params_var') and self.corr_params_var.get():
-                param_cols = [col for col in data.columns if col.startswith(('K4_', 'K5_', 'K6_'))]
-                columns_to_analyze.extend(param_cols)
-            
-            if hasattr(self, 'corr_features_var') and self.corr_features_var.get():
-                feature_cols = [col for col in data.columns if col.startswith(('ACCE_', 'DISP_'))]
-                columns_to_analyze.extend(feature_cols[:20])  # Limit for readability
-            
-            if hasattr(self, 'corr_cbush_var') and self.corr_cbush_var.get():
-                cbush_cols = [col for col in data.columns if col.startswith('cbush_') and col.endswith('_loose')]
-                columns_to_analyze.extend(cbush_cols)
-            
-            if not columns_to_analyze:
-                messagebox.showwarning("No Features Selected", "Please select features in the Correlation Matrix tab first")
-                return
-            
-            # Calculate correlation matrix
-            corr_matrix = data[columns_to_analyze].corr()
-            self.current_heatmap_data = corr_matrix
-            
-            # Clear previous plot
-            for widget in self.heatmap_info_label.master.winfo_children():
-                if isinstance(widget, tk.Canvas):
-                    widget.destroy()
-            
-            # Create matplotlib figure
-            fig_width = float(self.heatmap_width_var.get())
-            fig_height = float(self.heatmap_height_var.get())
-            
-            fig, ax = plt.subplots(figsize=(fig_width, fig_height))
-            
-            # Generate heatmap
-            sns.heatmap(corr_matrix, 
-                       annot=self.heatmap_annot_var.get(),
-                       cmap=self.heatmap_colormap_var.get(),
-                       cbar=self.heatmap_cbar_var.get(),
-                       center=0,
-                       square=True,
-                       fmt='.2f' if self.heatmap_annot_var.get() else '',
-                       ax=ax)
-            
-            plt.title('Feature Correlation Heatmap', fontsize=14, fontweight='bold')
-            plt.tight_layout()
-            
-            # Embed in tkinter
-            canvas = FigureCanvasTkAgg(fig, self.heatmap_info_label.master)
-            canvas.draw()
-            canvas.get_tk_widget().pack(fill='both', expand=True)
-            
-            # Hide the info label
-            self.heatmap_info_label.pack_forget()
-            
-            self.log_message(f"🔥 Generated heatmap with {len(columns_to_analyze)} features")
-            
-        except ImportError:
-            messagebox.showerror("Missing Libraries", 
-                               "Please install required packages:\n\npip install matplotlib seaborn")
-        except Exception as e:
-            messagebox.showerror("Heatmap Error", f"Failed to generate heatmap: {str(e)}")
-    
-    def save_heatmap(self):
-        """Save the current heatmap to file."""
-        if self.current_heatmap_data is None:
-            messagebox.showwarning("No Heatmap", "Please generate a heatmap first")
-            return
-        
-        try:
+       
+        comparison_df = self.ml_pipeline.get_model_comparison()
+        if comparison_df is not None:
             filename = filedialog.asksaveasfilename(
-                title="Save Heatmap",
-                defaultextension=".png",
-                filetypes=[("PNG Files", "*.png"), ("PDF Files", "*.pdf"), ("SVG Files", "*.svg"), ("All Files", "*.*")]
+                title="Export ML Results",
+                defaultextension=".csv",
+                filetypes=[("CSV Files", "*.csv")]
             )
-            
+           
             if filename:
-                import matplotlib.pyplot as plt
-                plt.savefig(filename, dpi=300, bbox_inches='tight')
-                self.log_message(f"💾 Heatmap saved: {Path(filename).name}")
-                messagebox.showinfo("Success", f"Heatmap saved successfully!\n\n{Path(filename).name}")
-                
-        except Exception as e:
-            messagebox.showerror("Save Error", f"Failed to save heatmap: {str(e)}")
-
-
-def create_gui():
-    """Create and run the GUI application."""
-    root = tk.Tk()
-    app = FeatureMatrixEditorGUI(root)
-    root.mainloop()
+                comparison_df.to_csv(filename, index=False)
+                self.log_message(f"📊 ML results exported: {filename}")
+                messagebox.showinfo("Success", f"Results exported to {filename}")
+   
+    def export_models(self):
+        """Export trained models."""
+        messagebox.showinfo("Export", "Model export functionality ready for implementation")
+   
+    def export_predictions(self):
+        """Export model predictions."""
+        messagebox.showinfo("Export", "Prediction export functionality ready for implementation")
+   
+    def log_message(self, message):
+        """Log message to status display."""
+        timestamp = time.strftime("%H:%M:%S")
+        log_entry = f"[{timestamp}] {message}\n"
+       
+        self.status_text.insert(tk.END, log_entry)
+        self.status_text.see(tk.END)
+        self.root.update_idletasks()
 
 
 def main():
-    """Main entry point - can run GUI or command line."""
-    # Check if any command line arguments provided
-    if len(sys.argv) > 1:
-        # Run command line interface
-        parser = argparse.ArgumentParser(description="Feature Matrix Editor for HEEDS Parameter-Feature Integration")
-        
-        # Required arguments
-        parser.add_argument('--param', '-p', required=True,
-                           help='Parameter file (CSV/TSV)')
-        parser.add_argument('--matrix', '-m', required=True,
-                           help='Feature matrix file (CSV)')
-        parser.add_argument('--heeds', '-d', required=True,
-                           help='HEEDS directory containing POST_0 folder')
-        
-        # Optional arguments
-        parser.add_argument('--output', '-o', default='edited_output',
-                           help='Output directory')
-        parser.add_argument('--study-name', '-s', default=None,
-                           help='Study name override')
-        parser.add_argument('--threshold', '-t', type=float, default=1e8,
-                           help='CBUSH loose threshold (default: 1e8)')
-        parser.add_argument('--combine-with', '-c', nargs='+', default=None,
-                           help='Additional enhanced study files to combine with')
-        parser.add_argument('--validate', '-v', action='store_true',
-                           help='Validate final dataset')
-        parser.add_argument('--quiet', '-q', action='store_true',
-                           help='Quiet mode')
-        
-        args = parser.parse_args()
-        
-        # Initialize feature matrix editor
-        editor = FeatureMatrixEditor(
-            output_dir=args.output,
-            verbose=not args.quiet
-        )
-        
-        try:
-            # Process primary study
-            result = editor.process_single_study(
-                param_file=args.param,
-                matrix_file=args.matrix,
-                heeds_directory=args.heeds,
-                study_name=args.study_name,
-                user_threshold=args.threshold
-            )
-            
-            if not result:
-                print("❌ Failed to process primary study")
-                return 1
-            
-            # Combine with additional studies if specified
-            if args.combine_with:
-                # Load additional study files
-                additional_files = []
-                for study_file in args.combine_with:
-                    if Path(study_file).exists():
-                        additional_files.append(study_file)
-                    else:
-                        editor.log(f"⚠️  Study file not found: {study_file}")
-                
-                if additional_files:
-                    # Add primary study output to combination
-                    primary_output = result['output_file']
-                    all_files = [primary_output] + additional_files
-                    
-                    combination_result = editor.combine_multiple_studies(
-                        study_files=all_files
-                    )
-                    
-                    if combination_result:
-                        final_file = combination_result['output_file']
-                    else:
-                        print("❌ Failed to combine studies")
-                        return 1
-                else:
-                    final_file = result['output_file']
-            else:
-                # Just process single study
-                final_file = result['output_file']
-            
-            # Validate final dataset if requested
-            if args.validate:
-                validation_result = editor.validate_enhanced_dataset(final_file)
-                if not validation_result:
-                    print("❌ Dataset validation failed")
-                    return 1
-            
-            # Generate comprehensive report
-            editor.generate_comprehensive_report()
-            
-            # Final success message
-            print(f"\n🎉 SUCCESS: Enhanced feature matrix created!")
-            print(f"📁 Output directory: {editor.output_dir}")
-            print(f"📊 Final dataset: {final_file}")
-            print(f"🎯 Threshold used: {args.threshold}")
-            
-            if args.validate and validation_result:
-                print(f"🎯 Data quality: {validation_result['data_quality_score']:.1%}")
-                print(f"📈 Total designs: {validation_result['total_designs']:,}")
-                print(f"📋 Total columns: {validation_result['total_columns']}")
-            
-            return 0
-            
-        except Exception as e:
-            print(f"\n❌ FEATURE MATRIX EDITING FAILED: {str(e)}")
-            return 1
-    
-    else:
-        # No command line arguments - run GUI
-        print("🚀 Starting Feature Matrix Editor v6.0 GUI...")
-        create_gui()
-        return 0
+    """Main entry point for the enhanced GUI."""
+    root = tk.Tk()
+    app = MassiveDatasetBoltDetectionGUI(root)
+    root.mainloop()
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
