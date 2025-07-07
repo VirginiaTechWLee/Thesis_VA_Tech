@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Feature Matrix Editor v6
+Feature Matrix Editor v7
 ========================
 
 Complete tool for editing and enhancing HEEDS feature matrices with parameter data.
@@ -18,7 +18,7 @@ Usage:
     python feature_matrix_editor_gui_v6.py --help
 
 Author: Enhanced Bolt Detection System
-Version: 6.0
+Version: 7.0
 """
 
 import pandas as pd
@@ -450,6 +450,13 @@ class FeatureMatrixEditor:
         try:
             self.log(f"🔧 Applying parameter-based CBUSH loose detection (threshold < {user_threshold:.0e})...")
             
+            # Normalize column names to handle case sensitivity
+            df_normalized = df.copy()
+            column_mapping = {}
+            for col in df.columns:
+                normalized_col = col.upper()
+                column_mapping[normalized_col] = col
+            
             # Keep original simulation-based columns for comparison
             simulation_cols = [col for col in df.columns if col.startswith('cbush_') and col.endswith('_loose')]
             for col in simulation_cols:
@@ -459,27 +466,106 @@ class FeatureMatrixEditor:
             # Apply parameter-based logic
             loose_count_by_cbush = {}
             
+            # Helper function to safely convert to numeric
+            def safe_numeric_conversion(value, default=5):
+                """Convert value to integer, handle various data types."""
+                if pd.isna(value):
+                    return default
+                try:
+                    # Handle string representations
+                    if isinstance(value, str):
+                        value = value.strip()
+                        if value == '':
+                            return default
+                    return int(float(value))
+                except (ValueError, TypeError):
+                    self.log(f"   ⚠️  Could not convert '{value}' to integer, using default {default}")
+                    return default
+            
+            # Helper function to get stiffness value
+            def get_stiffness_value(param_value, param_name=""):
+                """Get stiffness from parameter value with robust conversion."""
+                numeric_value = safe_numeric_conversion(param_value)
+                stiffness = self.stiffness_mapping.get(numeric_value, 1e8)
+                return stiffness, numeric_value
+            
+            self.log("🔍 Detailed CBUSH analysis:")
+            
             for cbush_num in range(2, 11):  # CBUSHes 2-10 only (omit CBUSH 1)
-                # CBUSHes 2-10: Check parameter values
-                k4_col = f'K4_{cbush_num}'
-                k5_col = f'K5_{cbush_num}'
-                k6_col = f'K6_{cbush_num}'
+                # Try different case combinations for column names
+                possible_k4_names = [f'K4_{cbush_num}', f'k4_{cbush_num}', f'K4{cbush_num}', f'k4{cbush_num}']
+                possible_k5_names = [f'K5_{cbush_num}', f'k5_{cbush_num}', f'K5{cbush_num}', f'k5{cbush_num}']
+                possible_k6_names = [f'K6_{cbush_num}', f'k6_{cbush_num}', f'K6{cbush_num}', f'k6{cbush_num}']
                 
-                if all(col in df.columns for col in [k4_col, k5_col, k6_col]):
-                    def is_loose_user_defined(row):
-                        """User-defined loose detection: minimum stiffness < user_threshold"""
-                        k4_stiffness = self.stiffness_mapping.get(row[k4_col], 1e8)
-                        k5_stiffness = self.stiffness_mapping.get(row[k5_col], 1e8) 
-                        k6_stiffness = self.stiffness_mapping.get(row[k6_col], 1e8)
+                # Find actual column names
+                k4_col = None
+                k5_col = None  
+                k6_col = None
+                
+                for name in possible_k4_names:
+                    if name in df.columns:
+                        k4_col = name
+                        break
+                
+                for name in possible_k5_names:
+                    if name in df.columns:
+                        k5_col = name
+                        break
+                        
+                for name in possible_k6_names:
+                    if name in df.columns:
+                        k6_col = name
+                        break
+                
+                if all([k4_col, k5_col, k6_col]):
+                    # Process this CBUSH with robust logic
+                    loose_results = []
+                    
+                    # Debug first row for CBUSH 2
+                    if cbush_num == 2:
+                        sample_row = df.iloc[0]
+                        k4_raw = sample_row[k4_col]
+                        k5_raw = sample_row[k5_col]
+                        k6_raw = sample_row[k6_col]
+                        
+                        k4_stiffness, k4_numeric = get_stiffness_value(k4_raw, k4_col)
+                        k5_stiffness, k5_numeric = get_stiffness_value(k5_raw, k5_col)
+                        k6_stiffness, k6_numeric = get_stiffness_value(k6_raw, k6_col)
+                        
+                        self.log(f"   🔍 DEBUG CBUSH 2 (first row):")
+                        self.log(f"      {k4_col} raw: '{k4_raw}' → numeric: {k4_numeric} → stiffness: {k4_stiffness:.0e}")
+                        self.log(f"      {k5_col} raw: '{k5_raw}' → numeric: {k5_numeric} → stiffness: {k5_stiffness:.0e}")
+                        self.log(f"      {k6_col} raw: '{k6_raw}' → numeric: {k6_numeric} → stiffness: {k6_stiffness:.0e}")
                         
                         min_stiffness = min(k4_stiffness, k5_stiffness, k6_stiffness)
-                        return 1 if min_stiffness < user_threshold else 0
+                        is_loose = 1 if min_stiffness < user_threshold else 0
+                        
+                        self.log(f"      Min stiffness: {min_stiffness:.0e}")
+                        self.log(f"      Threshold: {user_threshold:.0e}")
+                        self.log(f"      Is loose: {is_loose} ({'LOOSE' if is_loose else 'TIGHT'})")
                     
-                    df[f'cbush_{cbush_num}_loose'] = df.apply(is_loose_user_defined, axis=1)
-                    loose_count = df[f'cbush_{cbush_num}_loose'].sum()
+                    # Apply to all rows
+                    for idx, row in df.iterrows():
+                        k4_stiffness, _ = get_stiffness_value(row[k4_col])
+                        k5_stiffness, _ = get_stiffness_value(row[k5_col])
+                        k6_stiffness, _ = get_stiffness_value(row[k6_col])
+                        
+                        min_stiffness = min(k4_stiffness, k5_stiffness, k6_stiffness)
+                        is_loose = 1 if min_stiffness < user_threshold else 0
+                        loose_results.append(is_loose)
+                    
+                    # Update dataframe
+                    df[f'cbush_{cbush_num}_loose'] = loose_results
+                    loose_count = sum(loose_results)
                     loose_count_by_cbush[cbush_num] = loose_count
+                    
                 else:
-                    self.log(f"   ⚠️  Missing parameter columns for CBUSH {cbush_num}, keeping original")
+                    missing_cols = []
+                    if not k4_col: missing_cols.append(f'K4_{cbush_num}')
+                    if not k5_col: missing_cols.append(f'K5_{cbush_num}')
+                    if not k6_col: missing_cols.append(f'K6_{cbush_num}')
+                    
+                    self.log(f"   ⚠️  Missing parameter columns for CBUSH {cbush_num}: {missing_cols}")
                     loose_count_by_cbush[cbush_num] = df.get(f'cbush_{cbush_num}_loose', pd.Series([0])).sum()
             
             # CBUSH 1 is omitted as requested (stays constant)
@@ -840,7 +926,7 @@ class FeatureMatrixEditorGUI:
     def __init__(self, root):
         """Initialize the GUI."""
         self.root = root
-        self.root.title("Feature Matrix Editor v6.0")
+        self.root.title("Feature Matrix Editor v7.0")
         self.root.geometry("1400x900")
         self.root.configure(bg='#f0f0f0')
         
@@ -857,6 +943,10 @@ class FeatureMatrixEditorGUI:
         self.validate_var = tk.BooleanVar(value=True)
         self.threshold_var = tk.StringVar(value="1e8")  # Default to industry standard
         self.custom_threshold_var = tk.StringVar()
+        
+        # Combine studies variables
+        self.study1_file_var = tk.StringVar()
+        self.study2_file_var = tk.StringVar()
         
         # Stiffness mapping for reference table
         self.stiffness_mapping = {
@@ -1423,8 +1513,38 @@ class FeatureMatrixEditorGUI:
         tk.Button(button_frame, text="🔄 Process Study", command=self.process_single_study,
                  bg='#27ae60', fg='white', font=('Arial', 11, 'bold'), height=1, width=18).pack(fill='x', pady=2)
         
-        tk.Button(button_frame, text="🔗 Combine Studies", command=self.combine_studies,
-                 bg='#9b59b6', fg='white', font=('Arial', 11, 'bold'), height=1, width=18).pack(fill='x', pady=2)
+        tk.Button(button_frame, text="📋 Clear All", command=self.clear_all_inputs,
+                 bg='#f39c12', fg='white', font=('Arial', 11, 'bold'), height=1, width=18).pack(fill='x', pady=2)
+        
+        # Combine Studies section
+        combine_frame = ttk.LabelFrame(parent, text="🔗 Combine Studies")
+        combine_frame.pack(fill='x', pady=10)
+        
+        # Study 1 selection
+        study1_frame = tk.Frame(combine_frame)
+        study1_frame.pack(fill='x', padx=10, pady=5)
+        tk.Label(study1_frame, text="Study File 1:", font=('Arial', 10, 'bold')).pack(anchor='w')
+        study1_input_frame = tk.Frame(study1_frame)
+        study1_input_frame.pack(fill='x', pady=2)
+        tk.Entry(study1_input_frame, textvariable=self.study1_file_var, width=40, font=('Arial', 9)).pack(side='left', fill='x', expand=True)
+        tk.Button(study1_input_frame, text="Browse", command=self.browse_study1_file,
+                 bg='#9b59b6', fg='white', font=('Arial', 9, 'bold')).pack(side='right', padx=(5,0))
+        
+        # Study 2 selection
+        study2_frame = tk.Frame(combine_frame)
+        study2_frame.pack(fill='x', padx=10, pady=5)
+        tk.Label(study2_frame, text="Study File 2:", font=('Arial', 10, 'bold')).pack(anchor='w')
+        study2_input_frame = tk.Frame(study2_frame)
+        study2_input_frame.pack(fill='x', pady=2)
+        tk.Entry(study2_input_frame, textvariable=self.study2_file_var, width=40, font=('Arial', 9)).pack(side='left', fill='x', expand=True)
+        tk.Button(study2_input_frame, text="Browse", command=self.browse_study2_file,
+                 bg='#9b59b6', fg='white', font=('Arial', 9, 'bold')).pack(side='right', padx=(5,0))
+        
+        # Combine button
+        combine_button_frame = tk.Frame(combine_frame)
+        combine_button_frame.pack(fill='x', padx=10, pady=10)
+        tk.Button(combine_button_frame, text="🔗 Combine Selected Studies", command=self.combine_two_studies,
+                 bg='#e74c3c', fg='white', font=('Arial', 11, 'bold'), height=1, width=25).pack()
         
         tk.Button(button_frame, text="📋 Clear Log", command=self.clear_log,
                  bg='#95a5a6', fg='white', font=('Arial', 9, 'bold'), height=1, width=18).pack(fill='x', pady=2)
@@ -1479,6 +1599,11 @@ class FeatureMatrixEditorGUI:
         self.correlation_tab = ttk.Frame(self.preview_notebook)
         self.preview_notebook.add(self.correlation_tab, text="🔥 Correlation Matrix")
         self.create_correlation_tab(self.correlation_tab)
+        
+        # Tab 5: Heatmap Visualization
+        self.heatmap_tab = ttk.Frame(self.preview_notebook)
+        self.preview_notebook.add(self.heatmap_tab, text="🔥 Heatmap")
+        self.create_heatmap_tab(self.heatmap_tab)
         
         # Tab 6: Load Full Feature Matrix
         self.load_tab = ttk.Frame(self.preview_notebook)
@@ -2147,29 +2272,6 @@ class FeatureMatrixEditorGUI:
         self.log_message(f"❌ {error_msg}")
         messagebox.showerror("Processing Failed", f"An error occurred:\n\n{error_msg}")
     
-    def combine_studies(self):
-        """Load and combine multiple enhanced study files."""
-        study_files = filedialog.askopenfilenames(
-            title="Select Enhanced Study Files to Combine",
-            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")]
-        )
-        
-        if not study_files:
-            return
-        
-        if len(study_files) < 2:
-            messagebox.showwarning("Insufficient Files", "Please select at least 2 study files to combine")
-            return
-        
-        # Start combination process
-        self.start_progress()
-        self.update_status("Combining studies...")
-        self.log_message(f"🔗 Combining {len(study_files)} study files...")
-        
-        self.processing_thread = threading.Thread(target=self._combine_studies_thread, args=(study_files,))
-        self.processing_thread.daemon = True
-        self.processing_thread.start()
-    
     def _combine_studies_thread(self, study_files):
         """Combine studies in background thread."""
         try:
@@ -2245,6 +2347,271 @@ class FeatureMatrixEditorGUI:
         else:
             self.update_status("❌ Combination failed")
             messagebox.showerror("Combination Failed", "Study combination failed. Check the log for details.")
+    
+    def clear_all_inputs(self):
+        """Clear all input fields and data."""
+        # Clear file paths
+        self.param_file_var.set("")
+        self.matrix_file_var.set("")
+        self.heeds_dir_var.set("")
+        self.study_name_var.set("")
+        self.study1_file_var.set("")
+        self.study2_file_var.set("")
+        
+        # Clear data
+        self.param_data = None
+        self.matrix_data = None
+        self.combined_data = None
+        self.loaded_full_matrix = None
+        if hasattr(self, 'scaled_data'):
+            delattr(self, 'scaled_data')
+        
+        # Clear all preview tables
+        for tree in [self.param_tree, self.matrix_tree, self.combined_tree, self.load_tree]:
+            for item in tree.get_children():
+                tree.delete(item)
+        
+        # Reset info labels
+        self.param_info_label.config(text="No parameter file loaded", fg='#7f8c8d')
+        self.matrix_info_label.config(text="No feature matrix loaded", fg='#7f8c8d')
+        self.combined_info_label.config(text="No combined data available - process a study first", fg='#7f8c8d')
+        self.load_info_label.config(text="No full feature matrix loaded", fg='#7f8c8d')
+        
+        # Clear scaling results
+        if hasattr(self, 'before_scaling_text'):
+            self.before_scaling_text.delete('1.0', tk.END)
+            self.after_scaling_text.delete('1.0', tk.END)
+        
+        # Clear correlation results
+        if hasattr(self, 'correlation_text'):
+            self.correlation_text.delete('1.0', tk.END)
+            self.ai_suggestions_text.delete('1.0', tk.END)
+        
+        # Reset status
+        self.update_status("Ready")
+        
+        self.log_message("🧹 All inputs and data cleared")
+    
+    def browse_study1_file(self):
+        """Browse for first study file."""
+        filename = filedialog.askopenfilename(
+            title="Select First Study File",
+            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")]
+        )
+        if filename:
+            self.study1_file_var.set(filename)
+            self.log_message(f"📁 Study 1 selected: {Path(filename).name}")
+    
+    def browse_study2_file(self):
+        """Browse for second study file."""
+        filename = filedialog.askopenfilename(
+            title="Select Second Study File",
+            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")]
+        )
+        if filename:
+            self.study2_file_var.set(filename)
+            self.log_message(f"📁 Study 2 selected: {Path(filename).name}")
+    
+    def combine_two_studies(self):
+        """Combine two selected study files."""
+        study1_file = self.study1_file_var.get()
+        study2_file = self.study2_file_var.get()
+        
+        if not study1_file:
+            messagebox.showwarning("Missing File", "Please select Study File 1")
+            return
+        
+        if not study2_file:
+            messagebox.showwarning("Missing File", "Please select Study File 2")
+            return
+        
+        if not Path(study1_file).exists():
+            messagebox.showerror("File Not Found", f"Study File 1 not found:\n{study1_file}")
+            return
+        
+        if not Path(study2_file).exists():
+            messagebox.showerror("File Not Found", f"Study File 2 not found:\n{study2_file}")
+            return
+        
+        # Start combination process
+        self.start_progress()
+        self.update_status("Combining studies...")
+        self.log_message(f"🔗 Combining two study files...")
+        
+        study_files = [study1_file, study2_file]
+        self.processing_thread = threading.Thread(target=self._combine_studies_thread, args=(study_files,))
+        self.processing_thread.daemon = True
+        self.processing_thread.start()
+    
+    def create_heatmap_tab(self, parent):
+        """Create heatmap visualization tab."""
+        # Info frame
+        info_frame = tk.Frame(parent)
+        info_frame.pack(fill='x', padx=10, pady=10)
+        
+        tk.Label(info_frame, text="🔥 Correlation Heatmap Visualization", 
+                font=('Arial', 14, 'bold')).pack(anchor='w')
+        tk.Label(info_frame, text="Generate heatmaps based on correlation matrix selections", 
+                font=('Arial', 10), fg='#666666').pack(anchor='w')
+        
+        # Controls frame
+        controls_frame = ttk.LabelFrame(parent, text="Heatmap Settings")
+        controls_frame.pack(fill='x', padx=10, pady=10)
+        
+        # Settings
+        settings_frame = tk.Frame(controls_frame)
+        settings_frame.pack(fill='x', padx=10, pady=5)
+        
+        # Colormap selection
+        colormap_frame = tk.Frame(settings_frame)
+        colormap_frame.pack(fill='x', pady=5)
+        tk.Label(colormap_frame, text="Color Scheme:", font=('Arial', 10, 'bold')).pack(side='left')
+        self.heatmap_colormap_var = tk.StringVar(value="RdYlBu_r")
+        colormap_combo = ttk.Combobox(colormap_frame, textvariable=self.heatmap_colormap_var,
+                                     values=["RdYlBu_r", "coolwarm", "viridis", "plasma", "inferno", "magma"],
+                                     width=15)
+        colormap_combo.pack(side='left', padx=10)
+        
+        # Size settings
+        size_frame = tk.Frame(settings_frame)
+        size_frame.pack(fill='x', pady=5)
+        tk.Label(size_frame, text="Figure Size:", font=('Arial', 10, 'bold')).pack(side='left')
+        self.heatmap_width_var = tk.StringVar(value="12")
+        self.heatmap_height_var = tk.StringVar(value="8")
+        tk.Label(size_frame, text="Width:").pack(side='left', padx=(10,2))
+        tk.Entry(size_frame, textvariable=self.heatmap_width_var, width=5).pack(side='left')
+        tk.Label(size_frame, text="Height:").pack(side='left', padx=(10,2))
+        tk.Entry(size_frame, textvariable=self.heatmap_height_var, width=5).pack(side='left')
+        
+        # Options
+        options_frame = tk.Frame(settings_frame)
+        options_frame.pack(fill='x', pady=5)
+        self.heatmap_annot_var = tk.BooleanVar(value=True)
+        self.heatmap_cbar_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(options_frame, text="Show values", variable=self.heatmap_annot_var).pack(side='left')
+        tk.Checkbutton(options_frame, text="Show colorbar", variable=self.heatmap_cbar_var).pack(side='left', padx=20)
+        
+        # Generate button
+        button_frame = tk.Frame(controls_frame)
+        button_frame.pack(fill='x', padx=10, pady=10)
+        
+        tk.Button(button_frame, text="🔥 Generate Heatmap", command=self.generate_heatmap,
+                 bg='#e74c3c', fg='white', font=('Arial', 11, 'bold'), height=1, width=20).pack(side='left', padx=5)
+        
+        tk.Button(button_frame, text="💾 Save Heatmap", command=self.save_heatmap,
+                 bg='#27ae60', fg='white', font=('Arial', 11, 'bold'), height=1, width=15).pack(side='left', padx=5)
+        
+        # Results frame
+        results_frame = ttk.LabelFrame(parent, text="📊 Heatmap Display")
+        results_frame.pack(fill='both', expand=True, padx=10, pady=10)
+        
+        # Placeholder for matplotlib figure
+        self.heatmap_info_label = tk.Label(results_frame, 
+                                          text="🔥 Generate a correlation heatmap using the settings above.\n\nNote: Requires matplotlib. Install with: pip install matplotlib seaborn", 
+                                          font=('Arial', 12), fg='#666666', justify='center')
+        self.heatmap_info_label.pack(expand=True)
+        
+        self.current_heatmap_data = None
+    
+    def generate_heatmap(self):
+        """Generate correlation heatmap visualization."""
+        try:
+            import matplotlib.pyplot as plt
+            import seaborn as sns
+            import numpy as np
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+            
+            # Use scaled data if available, otherwise original
+            data = self.scaled_data if hasattr(self, 'scaled_data') else self.combined_data
+            
+            if data is None:
+                messagebox.showwarning("No Data", "Please process a study first")
+                return
+            
+            # Get feature selection from correlation tab
+            columns_to_analyze = []
+            
+            if hasattr(self, 'corr_params_var') and self.corr_params_var.get():
+                param_cols = [col for col in data.columns if col.startswith(('K4_', 'K5_', 'K6_'))]
+                columns_to_analyze.extend(param_cols)
+            
+            if hasattr(self, 'corr_features_var') and self.corr_features_var.get():
+                feature_cols = [col for col in data.columns if col.startswith(('ACCE_', 'DISP_'))]
+                columns_to_analyze.extend(feature_cols[:20])  # Limit for readability
+            
+            if hasattr(self, 'corr_cbush_var') and self.corr_cbush_var.get():
+                cbush_cols = [col for col in data.columns if col.startswith('cbush_') and col.endswith('_loose')]
+                columns_to_analyze.extend(cbush_cols)
+            
+            if not columns_to_analyze:
+                messagebox.showwarning("No Features Selected", "Please select features in the Correlation Matrix tab first")
+                return
+            
+            # Calculate correlation matrix
+            corr_matrix = data[columns_to_analyze].corr()
+            self.current_heatmap_data = corr_matrix
+            
+            # Clear previous plot
+            for widget in self.heatmap_info_label.master.winfo_children():
+                if isinstance(widget, tk.Canvas):
+                    widget.destroy()
+            
+            # Create matplotlib figure
+            fig_width = float(self.heatmap_width_var.get())
+            fig_height = float(self.heatmap_height_var.get())
+            
+            fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+            
+            # Generate heatmap
+            sns.heatmap(corr_matrix, 
+                       annot=self.heatmap_annot_var.get(),
+                       cmap=self.heatmap_colormap_var.get(),
+                       cbar=self.heatmap_cbar_var.get(),
+                       center=0,
+                       square=True,
+                       fmt='.2f' if self.heatmap_annot_var.get() else '',
+                       ax=ax)
+            
+            plt.title('Feature Correlation Heatmap', fontsize=14, fontweight='bold')
+            plt.tight_layout()
+            
+            # Embed in tkinter
+            canvas = FigureCanvasTkAgg(fig, self.heatmap_info_label.master)
+            canvas.draw()
+            canvas.get_tk_widget().pack(fill='both', expand=True)
+            
+            # Hide the info label
+            self.heatmap_info_label.pack_forget()
+            
+            self.log_message(f"🔥 Generated heatmap with {len(columns_to_analyze)} features")
+            
+        except ImportError:
+            messagebox.showerror("Missing Libraries", 
+                               "Please install required packages:\n\npip install matplotlib seaborn")
+        except Exception as e:
+            messagebox.showerror("Heatmap Error", f"Failed to generate heatmap: {str(e)}")
+    
+    def save_heatmap(self):
+        """Save the current heatmap to file."""
+        if self.current_heatmap_data is None:
+            messagebox.showwarning("No Heatmap", "Please generate a heatmap first")
+            return
+        
+        try:
+            filename = filedialog.asksaveasfilename(
+                title="Save Heatmap",
+                defaultextension=".png",
+                filetypes=[("PNG Files", "*.png"), ("PDF Files", "*.pdf"), ("SVG Files", "*.svg"), ("All Files", "*.*")]
+            )
+            
+            if filename:
+                import matplotlib.pyplot as plt
+                plt.savefig(filename, dpi=300, bbox_inches='tight')
+                self.log_message(f"💾 Heatmap saved: {Path(filename).name}")
+                messagebox.showinfo("Success", f"Heatmap saved successfully!\n\n{Path(filename).name}")
+                
+        except Exception as e:
+            messagebox.showerror("Save Error", f"Failed to save heatmap: {str(e)}")
 
 
 def create_gui():
